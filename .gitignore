@@ -20,6 +20,7 @@
 !/portal/public/*.svg
 !/assets/
 !/assets/*.png
+!/assets/*.mp4
 !/onboarding/
 !/onboarding/*.sh
 !/tests/

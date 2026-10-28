@@ -16,6 +16,8 @@ It works for one person or for many:
 Run it privately over **Tailscale**, or add an optional **website** where people
 sign in with Google, connect their computers and add their own accounts.
 
+<p align="center"><a href="assets/multi-account-hub.mp4"><img src="assets/video-poster.png" alt="Watch the 32-second tour of Multi-Account Hub" width="480"></a><br><sub>Music: "Mechanichal Meaning of a Peanut" by Lemoneight, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a></sub></p>
+
 ## Inspired by T3 Code
 
 We spend our days in [T3 Code](https://t3.codes), and this hub grew out of it.
