@@ -1,0 +1,2 @@
+# Unified diff context deliberately has a leading space before Go tabs.
+upstream/patches/*.patch -whitespace

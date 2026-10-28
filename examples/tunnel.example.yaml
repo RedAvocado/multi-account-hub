@@ -1,0 +1,7 @@
+# Cloudflare Tunnel for a hub with a website. Not needed for a Tailscale-only hub.
+tunnel: "REPLACE_WITH_TUNNEL_UUID"
+credentials-file: "/Users/YOUR_USER/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json"
+ingress:
+  - hostname: hub.example.com
+    service: http://127.0.0.1:18317
+  - service: http_status:404

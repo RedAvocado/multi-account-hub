@@ -1,0 +1,7 @@
+{
+  "hubUrl": "https://hub.example.com",
+  "portal": {
+    "workspaceDomain": "example.com",
+    "googleCredentialsFile": "~/.config/multi-account-hub/google-oauth.env"
+  }
+}

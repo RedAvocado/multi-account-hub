@@ -1,0 +1,21 @@
+{
+  "goToolchain": "go1.26.10",
+  "projects": {
+    "proxy": {
+      "url": "https://github.com/router-for-me/CLIProxyAPI.git",
+      "commit": "d946c4fba6fc9a5cfbca1f3d85184d62ad2fb683",
+      "directory": "CLIProxyAPI",
+      "patch": "proxy-guard.patch"
+    },
+    "router": {
+      "url": "https://github.com/tuzilj1/cliproxyapi-key-router.git",
+      "commit": "ceb89df6e586e713e8fd88dc21e309860d8547f8",
+      "directory": "key-router-source",
+      "patch": "key-router.patch"
+    }
+  },
+  "authHelper": {
+    "base": "proxy",
+    "patch": "auth-helper-loopback.patch"
+  }
+}

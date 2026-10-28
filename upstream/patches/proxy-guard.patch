@@ -1,0 +1,134 @@
+diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
+index 7cdacb7..5842a43 100644
+--- a/sdk/cliproxy/auth/conductor_selection.go
++++ b/sdk/cliproxy/auth/conductor_selection.go
+@@ -28,6 +28,11 @@ func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
+ }
+ 
+ func (m *Manager) hasPluginScheduler() bool {
++	// This dedicated hub build must never bypass per-user account routing.
++	// Force the checked path even if the plugin failed to load or was disabled.
++	if hubRequireScheduler {
++		return true
++	}
+ 	if m == nil {
+ 		return false
+ 	}
+@@ -43,6 +48,8 @@ func (m *Manager) hasPluginScheduler() bool {
+ 	return true
+ }
+ 
++const hubRequireScheduler = true
++
+ func pluginSchedulerWantsAcrossPriorities(scheduler PluginScheduler) bool {
+ 	if scheduler == nil {
+ 		return false
+@@ -1817,6 +1824,9 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
+ 
+ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+ 	if m.HomeEnabled() {
++		if hubRequireScheduler {
++			return nil, nil, &Error{Code: "auth_unavailable", Message: "hub account router is unavailable in Home mode"}
++		}
+ 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+ 		return auth, exec, err
+ 	}
+@@ -1893,6 +1903,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
+ 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
+ 		return nil, nil, errPick
+ 	}
++	if !handled && hubRequireScheduler {
++		return nil, nil, &Error{Code: "auth_unavailable", Message: "hub account router is unavailable"}
++	}
+ 	if !handled {
+ 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+ 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+@@ -2088,6 +2101,9 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
+ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+ 	opts.EnsureMetadata()
+ 	if m.HomeEnabled() {
++		if hubRequireScheduler {
++			return nil, nil, &Error{Code: "auth_unavailable", Message: "hub account router is unavailable in Home mode"}
++		}
+ 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+ 		return auth, exec, err
+ 	}
+@@ -2148,6 +2164,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
+ 
+ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+ 	if m.HomeEnabled() {
++		if hubRequireScheduler {
++			return nil, nil, "", &Error{Code: "auth_unavailable", Message: "hub account router is unavailable in Home mode"}
++		}
+ 		return m.pickNextViaHome(ctx, model, opts, tried)
+ 	}
+ 
+@@ -2239,6 +2258,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+ 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
+ 		return nil, nil, "", errPick
+ 	}
++	if !handled && hubRequireScheduler {
++		return nil, nil, "", &Error{Code: "auth_unavailable", Message: "hub account router is unavailable"}
++	}
+ 	if !handled {
+ 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
+ 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+@@ -2274,6 +2296,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+ 	opts.EnsureMetadata()
+ 	if m.HomeEnabled() {
++		if hubRequireScheduler {
++			return nil, nil, "", &Error{Code: "auth_unavailable", Message: "hub account router is unavailable in Home mode"}
++		}
+ 		return m.pickNextViaHome(ctx, model, opts, tried)
+ 	}
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+diff --git a/sdk/cliproxy/auth/hub_router_guard_test.go b/sdk/cliproxy/auth/hub_router_guard_test.go
+new file mode 100644
+index 0000000..a3af6eb
+--- /dev/null
++++ b/sdk/cliproxy/auth/hub_router_guard_test.go
+@@ -0,0 +1,43 @@
++package auth
++
++import (
++	"context"
++	"testing"
++
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++func TestHubGuardRejectsUnavailableScheduler(t *testing.T) {
++	for _, mixed := range []bool{false, true} {
++		for _, scheduler := range []string{"missing", "unhandled"} {
++			m := NewManager(nil, &RoundRobinSelector{}, nil)
++			m.executors["gemini"] = schedulerTestExecutor{}
++			if _, err := m.Register(context.Background(), &Auth{ID: "personal", Provider: "gemini"}); err != nil {
++				t.Fatal(err)
++			}
++			if scheduler == "unhandled" {
++				m.SetPluginScheduler(&fakePluginScheduler{handled: false})
++			}
++			if mixed {
++				if auth, _, _, err := m.pickNextMixed(context.Background(), []string{"gemini"}, "", cliproxyexecutor.Options{}, nil); err == nil || auth != nil {
++					t.Fatalf("mixed %s scheduler unexpectedly returned %v, err=%v", scheduler, auth, err)
++				}
++			} else if auth, _, err := m.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); err == nil || auth != nil {
++				t.Fatalf("%s scheduler unexpectedly returned %v, err=%v", scheduler, auth, err)
++			}
++		}
++	}
++}
++
++func TestHubGuardAllowsExplicitSchedulerSelection(t *testing.T) {
++	m := NewManager(nil, &RoundRobinSelector{}, nil)
++	m.executors["gemini"] = schedulerTestExecutor{}
++	if _, err := m.Register(context.Background(), &Auth{ID: "work", Provider: "gemini"}); err != nil {
++		t.Fatal(err)
++	}
++	m.SetPluginScheduler(&fakePluginScheduler{handled: true, resp: pluginapi.SchedulerPickResponse{Handled: true, AuthID: "work"}})
++	if a, _, err := m.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); err != nil || a == nil || a.ID != "work" {
++		t.Fatalf("allowed selection failed: auth=%v err=%v", a, err)
++	}
++}

@@ -1,0 +1,38 @@
+# Template only. Replace every placeholder and use private file permissions.
+config-version: 8
+server:
+  host: "127.0.0.1"
+  port: 8317
+  commercial-mode: true
+management:
+  allow-remote: false
+  secret-key: "REPLACE_WITH_PRIVATE_MANAGEMENT_KEY"
+access:
+  api-keys: ["REPLACE_WITH_RANDOM_INTERNAL_MEMBER_KEY"]
+oauth:
+  auth-dir: "/Users/YOUR_USER/.cli-proxy-api"
+routing:
+  strategy: "round-robin"
+  session-affinity: true
+  session-affinity-ttl: "1h"
+  cooldown:
+    disable-cooling: false
+  retry:
+    request-retry: 3
+    max-retry-interval: 30
+plugins:
+  enabled: true
+  dir: "/Users/YOUR_USER/.local/share/cliproxy-hub/plugins"
+  configs:
+    key-router:
+      enabled: true
+      priority: 1
+      debug: false
+      users:
+        - name: alex
+          api-keys: ["REPLACE_WITH_RANDOM_INTERNAL_MEMBER_KEY"]
+          primary: []
+          access: []
+observability:
+  logs:
+    request-log: false

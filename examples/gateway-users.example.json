@@ -1,0 +1,12 @@
+{
+  "users": [
+    {
+      "name": "alex",
+      "email": "alex@example.com",
+      "role": "admin",
+      "owner": true,
+      "enabled": false,
+      "keyHash": "REPLACE_WITH_SHA256_OF_INTERNAL_KEY"
+    }
+  ]
+}

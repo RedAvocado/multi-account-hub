@@ -1,0 +1,294 @@
+diff --git a/go.mod b/go.mod
+index 2e159d4..22b997e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/tuzilj1/cliproxyapi-key-router
+ 
+-go 1.26.0
++go 1.26.10
+ 
+ require (
+ 	github.com/router-for-me/CLIProxyAPI/v8 v8.0.0
+diff --git a/main.go b/main.go
+index 3a3a1b3..bc715d4 100644
+--- a/main.go
++++ b/main.go
+@@ -50,7 +50,9 @@ import (
+ 	"os"
+ 	"sort"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
++	"time"
+ 	"unsafe"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+@@ -69,6 +71,19 @@ var configUI []byte
+ 
+ var currentConfig atomic.Value
+ 
++// The proxy does not persist conversation content or affinity state. A
++// bounded, in-memory mapping keeps a client's session on its chosen account.
++type sessionBinding struct {
++	authID  string
++	expires time.Time
++}
++
++var affinity = struct {
++	sync.Mutex
++	bindings map[string]sessionBinding
++	cursors  map[string]uint64
++}{bindings: map[string]sessionBinding{}, cursors: map[string]uint64{}}
++
+ type envelope struct {
+ 	OK     bool            `json:"ok"`
+ 	Result json.RawMessage `json:"result,omitempty"`
+@@ -114,8 +129,6 @@ const (
+ type userRules struct {
+ 	primary []string
+ 	access  []string
+-	// unrestricted users fall back to built-in routing instead of being rejected.
+-	unrestricted bool
+ }
+ 
+ type pluginConfig struct {
+@@ -263,7 +276,6 @@ func compile(cfg pluginConfig) (*routingTable, error) {
+ 		rules := userRules{primary: normalizeRules(user.Primary), access: normalizeRules(user.Access)}
+ 		if len(user.Primary) == 0 && len(user.Access) == 0 && len(user.Auths) > 0 {
+ 			rules.primary = normalizeRules(user.Auths)
+-			rules.unrestricted = true
+ 		}
+ 		table.rules[user] = rules
+ 	}
+@@ -317,13 +329,12 @@ func pickAuth(raw []byte) ([]byte, error) {
+ 	}
+ 	table := loadedConfig()
+ 	if table == nil || len(table.byKey) == 0 {
+-		return unhandled()
++		return rejectSelection("routing configuration is unavailable")
+ 	}
+ 
+ 	user := table.userFor(req.Options)
+ 	if user == nil {
+-		logf(table, "model=%s: unknown client key, built-in routing", req.Model)
+-		return unhandled()
++		return rejectSelection("caller has no assigned account permissions")
+ 	}
+ 
+ 	var primary, access []pluginapi.SchedulerAuthCandidate
+@@ -335,18 +346,14 @@ func pickAuth(raw []byte) ([]byte, error) {
+ 			access = append(access, candidate)
+ 		}
+ 	}
+-	if pick, ok := best(primary); ok {
++	if pick, ok := bestForSession(user, req, primary); ok {
+ 		logf(table, "user=%s model=%s: primary %s", user.Name, req.Model, pick)
+ 		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
+ 	}
+-	if pick, ok := best(access); ok {
++	if pick, ok := bestForSession(user, req, access); ok {
+ 		logf(table, "user=%s model=%s: no primary available, access %s", user.Name, req.Model, pick)
+ 		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
+ 	}
+-	if table.rules[user].unrestricted {
+-		logf(table, "user=%s model=%s: no own account available, built-in routing over %d candidate(s)", user.Name, req.Model, len(req.Candidates))
+-		return unhandled()
+-	}
+ 	logf(table, "user=%s model=%s: rejected, none of %d candidate(s) is allowed", user.Name, req.Model, len(req.Candidates))
+ 	return okEnvelope(pluginapi.SchedulerPickResponse{
+ 		Handled:      true,
+@@ -356,8 +363,7 @@ func pickAuth(raw []byte) ([]byte, error) {
+ 	})
+ }
+ 
+-// best picks fill-first: highest priority, then stable ID order.
+-func best(candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
++func bestForSession(user *userConfig, req pluginapi.SchedulerPickRequest, candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
+ 	if len(candidates) == 0 {
+ 		return "", false
+ 	}
+@@ -367,7 +373,68 @@ func best(candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
+ 		}
+ 		return candidates[i].ID < candidates[j].ID
+ 	})
+-	return candidates[0].ID, true
++	session := ""
++	for _, wanted := range []string{"session-id", "session_id", "x-session-id", "thread-id", "x-codex-session-id"} {
++		for key, values := range req.Options.Headers {
++			if strings.EqualFold(key, wanted) && len(values) > 0 {
++				session = strings.TrimSpace(values[0])
++				break
++			}
++		}
++		if session != "" {
++			break
++		}
++	}
++	if session == "" {
++		for _, key := range []string{"canonical_session_id", "execution_session_id", "derived_session_id"} {
++			if value, ok := req.Options.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
++				session = strings.TrimSpace(value)
++				break
++			}
++		}
++	}
++	if session == "" {
++		// Without a reliable session identity, preserve upstream's fill-first
++		// behavior instead of changing credentials on every tool call.
++		return candidates[0].ID, true
++	}
++	group := user.Name + "\x00" + req.Provider + "\x00" + req.Model
++	digest := sha256.Sum256([]byte(group + "\x00" + session))
++	key := hex.EncodeToString(digest[:])
++	now := time.Now()
++	affinity.Lock()
++	defer affinity.Unlock()
++	if binding, ok := affinity.bindings[key]; ok && now.Before(binding.expires) {
++		for _, candidate := range candidates {
++			if candidate.ID == binding.authID {
++				binding.expires = now.Add(time.Hour)
++				affinity.bindings[key] = binding
++				return candidate.ID, true
++			}
++		}
++	}
++	if len(affinity.bindings) >= 4096 {
++		for existing, binding := range affinity.bindings {
++			if !now.Before(binding.expires) {
++				delete(affinity.bindings, existing)
++			}
++		}
++		if len(affinity.bindings) >= 4096 {
++			// Hard cap prevents unbounded memory use from untrusted sessions.
++			for existing := range affinity.bindings {
++				delete(affinity.bindings, existing)
++				break
++			}
++		}
++	}
++	eligible := 1
++	for eligible < len(candidates) && candidates[eligible].Priority == candidates[0].Priority {
++		eligible++
++	}
++	choice := candidates[affinity.cursors[group]%uint64(eligible)].ID
++	affinity.cursors[group]++
++	affinity.bindings[key] = sessionBinding{authID: choice, expires: now.Add(time.Hour)}
++	return choice, true
+ }
+ 
+ // tier classifies an account for a user; primary wins over access.
+@@ -388,6 +455,12 @@ func matchesAny(rules []string, candidate pluginapi.SchedulerAuthCandidate) bool
+ 	note := strings.ToLower(candidate.Attributes["note"])
+ 	provider := strings.ToLower(candidate.Provider)
+ 	for _, rule := range rules {
++		if exactID, exact := strings.CutPrefix(rule, "id="); exact {
++			if exactID != "" && id == exactID {
++				return true
++			}
++			continue
++		}
+ 		if ruleProvider, identity, scoped := strings.Cut(rule, ":"); scoped {
+ 			if ruleProvider == provider && containsToken(id, identity) {
+ 				return true
+@@ -429,9 +502,7 @@ func isIdentityChar(c byte) bool {
+ // ?key=). Request headers are a fallback for hosts without caller_scope.
+ func (t *routingTable) userFor(opts pluginapi.SchedulerOptions) *userConfig {
+ 	if scope, _ := opts.Metadata["caller_scope"].(string); scope != "" {
+-		if user := t.byScope[scope]; user != nil {
+-			return user
+-		}
++		return t.byScope[scope]
+ 	}
+ 	get := func(name string) string {
+ 		for key, values := range opts.Headers {
+@@ -480,8 +551,9 @@ func handleManagement(raw []byte) ([]byte, error) {
+ 	})
+ }
+ 
+-func unhandled() ([]byte, error) {
+-	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
++func rejectSelection(reason string) ([]byte, error) {
++	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, Reject: true,
++		RejectCode: "auth_unavailable", RejectReason: reason})
+ }
+ 
+ func loadedConfig() *routingTable {
+diff --git a/router_test.go b/router_test.go
+index fa63e3d..9b1bc16 100644
+--- a/router_test.go
++++ b/router_test.go
+@@ -96,21 +96,67 @@ func TestPrimaryWinsOverAccess(t *testing.T) {
+ 	}
+ }
+ 
+-func TestLegacyAuthsFallBackToBuiltin(t *testing.T) {
++func TestLegacyAuthsRejectUnassigned(t *testing.T) {
+ 	configureForTest(t)
+ 	legacy := pluginapi.SchedulerAuthCandidate{ID: "claude-legacy@example.com.json"}
+ 	if got := pick(t, scope("key-l"), authJ, legacy); got.AuthID != legacy.ID {
+ 		t.Fatalf("legacy primary: got %+v", got)
+ 	}
+-	if got := pick(t, scope("key-l"), authJ); got.Handled {
+-		t.Fatalf("legacy fallback should be unhandled, got %+v", got)
++	if got := pick(t, scope("key-l"), authJ); !got.Handled || !got.Reject {
++		t.Fatalf("legacy rules must reject unassigned accounts, got %+v", got)
+ 	}
+ }
+ 
+-func TestUnknownKeyUnhandled(t *testing.T) {
++func TestUnknownKeyRejected(t *testing.T) {
+ 	configureForTest(t)
+-	if got := pick(t, scope("other"), authJ, authM); got.Handled {
+-		t.Fatalf("expected unhandled, got %+v", got)
++	if got := pick(t, scope("other"), authJ, authM); !got.Handled || !got.Reject {
++		t.Fatalf("expected rejection, got %+v", got)
++	}
++}
++
++func TestExactAccountRulesAndScopeCannotBeSpoofed(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: team, api-keys: [team-key], primary: [id=codex-work.json]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	work := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json", Provider: "codex"}
++	personal := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json-personal", Provider: "codex"}
++	if got := pick(t, scope("team-key"), personal, work); got.AuthID != work.ID {
++		t.Fatalf("team must receive only its exact work credential, got %+v", got)
++	}
++	if got := pick(t, scope("team-key"), personal); !got.Reject {
++		t.Fatalf("similar personal credential must be rejected, got %+v", got)
++	}
++	opts := scope("not-team-key")
++	opts.Headers = map[string][]string{"X-Api-Key": {"team-key"}}
++	if got := pick(t, opts, work); !got.Reject {
++		t.Fatalf("an authenticated scope must not be overridden by a header, got %+v", got)
++	}
++}
++
++func TestHubSessionsRotateThenStayOnAllowedAccount(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: affinity-test, api-keys: [k], primary: [id=work-a, id=work-b]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	a := pluginapi.SchedulerAuthCandidate{ID: "work-a", Provider: "codex"}
++	b := pluginapi.SchedulerAuthCandidate{ID: "work-b", Provider: "codex"}
++	personal := pluginapi.SchedulerAuthCandidate{ID: "personal", Provider: "codex"}
++	options := func(id string) pluginapi.SchedulerOptions {
++		o := scope("k")
++		o.Headers = map[string][]string{"Session-Id": {id}}
++		return o
++	}
++	first := pick(t, options("one"), personal, a, b)
++	second := pick(t, options("two"), personal, a, b)
++	if first.Reject || second.Reject || first.AuthID == second.AuthID || first.AuthID == "personal" || second.AuthID == "personal" {
++		t.Fatalf("sessions were not distributed across permitted accounts: %+v %+v", first, second)
++	}
++	if again := pick(t, options("one"), personal, b, a); again.AuthID != first.AuthID {
++		t.Fatalf("same session changed accounts: before=%+v after=%+v", first, again)
++	}
++	if lostWork := pick(t, options("one"), personal); !lostWork.Reject {
++		t.Fatalf("team session fell back to personal account: %+v", lostWork)
+ 	}
+ }
+ 
