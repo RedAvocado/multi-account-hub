@@ -26,6 +26,11 @@ test('setup prompt copies the current one-time code and expires safely', async (
   assert.match(element('#setup-prompt').textContent, /https:\/\/hub\.example\.com\/setup-provider-hub\.sh/);
   assert.match(element('#setup-prompt').textContent, /per-account usage automatically/);
   assert.match(element('#setup-prompt').textContent, /without consuming the setup code or replacing credentials/);
+  assert.match(element('#setup-prompt').textContent, /HUB Codex skills to ~\/\.codex\/skills/);
+  assert.match(element('#setup-prompt').textContent, /HUB Claude skills to ~\/\.claude\/skills/);
+  assert.match(element('#setup-prompt').textContent, /repairs skills sharing/);
+  assert.match(element('#setup-prompt').textContent, /syncs their coding models from the hub's current model catalog/);
+  assert.match(element('#setup-prompt').textContent, /custom models, model preferences/);
   assert.equal(delay, 2 * 60 * 60 * 1000);
   await element('#copy-prompt').callback();
   assert.equal(copied, element('#setup-prompt').textContent);

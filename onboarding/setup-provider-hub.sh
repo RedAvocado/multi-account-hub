@@ -12,7 +12,7 @@ case "${1:-}" in
   *) printf 'Usage: bash setup.sh [--key]\n' >&2; exit 2 ;;
 esac
 
-# Fetch and check the usage integration before consuming a setup code/key.
+# Fetch and check the T3 integration before consuming a setup code/key.
 usage_setup_dir="$(mktemp -d)"
 trap 'rm -rf "$usage_setup_dir"' EXIT
 curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
@@ -20,10 +20,72 @@ curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
 node "$usage_setup_dir/setup.cjs" --check
 configure_usage() {
   if ! node "$usage_setup_dir/setup.cjs" --codex-home "$HOME/.dittodub-provider-hub/codex"; then
-    printf 'Your saved hub credentials were preserved. Open T3 and rerun this setup command to finish usage setup.\n' >&2
+    printf 'Your saved hub credentials were preserved. Open T3 and rerun this setup command to finish provider, model, and usage setup.\n' >&2
     return 1
   fi
 }
+
+# Share skills with the normal local installations, including on setup reruns.
+# Keep provider homes separate: only the skills directories are linked.
+configure_skills() {
+  python3 - <<'PY'
+import os, pathlib, sys, tempfile
+
+home = pathlib.Path.home()
+root = home / '.dittodub-provider-hub'
+pairs = [(home / '.codex' / 'skills', root / 'codex' / 'skills'),
+         (home / '.claude' / 'skills', root / 'claude' / 'skills')]
+try:
+    # Check both providers before changing either one. Custom hub-only skills
+    # need a deliberate merge; never hide or overwrite them during an upgrade.
+    for source, target in pairs:
+        for directory in (root, target.parent):
+            if directory.is_symlink() or (directory.exists() and
+                    (not directory.is_dir() or directory.stat().st_uid != os.getuid())):
+                raise ValueError(f'Cannot safely use provider directory: {directory}')
+        if source.is_symlink() and not source.is_dir():
+            raise ValueError(f'The usual skills folder has a broken link: {source}')
+        if source.exists() and not source.is_dir():
+            raise ValueError(f'The usual skills path is not a directory: {source}')
+        if target.is_symlink():
+            if target.resolve() != source.resolve():
+                raise ValueError(f'{target} already links elsewhere. Keep or merge those skills before linking it to {source}.')
+        elif target.exists():
+            if not target.is_dir() or any(p.name != '.system' for p in target.iterdir()):
+                raise ValueError(f'{target} contains existing files. Merge those skills into {source}, then move the old folder aside and rerun setup.')
+        if source.resolve() == root.resolve() or root.resolve() in source.resolve().parents:
+            raise ValueError(f'The usual skills folder points inside the hub home: {source}')
+
+    for source, target in pairs:
+        source.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if target.is_symlink():
+            continue
+        backup = None
+        if target.exists():
+            backups = root / 'backups'
+            if backups.is_symlink():
+                raise ValueError(f'The backup directory is a symbolic link: {backups}')
+            backups.mkdir(mode=0o700, exist_ok=True)
+            backup = pathlib.Path(tempfile.mkdtemp(prefix='skills-', dir=backups)) / (target.parent.name + '-skills')
+            target.rename(backup)
+        try:
+            target.symlink_to(source, target_is_directory=True)
+        except OSError:
+            if backup is not None:
+                backup.rename(target)
+            raise
+        if backup is not None:
+            print(f'Previous built-in skills preserved at {backup}.')
+    print('HUB Codex shares ~/.codex/skills; HUB Claude shares ~/.claude/skills, including future additions.')
+    print('Start a new T3 conversation to reload skills; refresh T3 if the skill picker is stale.')
+except (OSError, ValueError, RuntimeError) as error:
+    print(f'Skills setup failed: {error}', file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+configure_skills
 
 if [ -e "$HOME/.dittodub-provider-hub/codex/config.toml" ]; then
   configure_usage
@@ -156,8 +218,9 @@ except OSError:
     print('Hub configuration could not be saved. Create a new setup code and try again.', file=sys.stderr)
     raise SystemExit(1)
 print(f'Private configuration saved at {target}.')
-print(f'In T3 Code, add a Codex provider named HUB Codex with CODEX_HOME set to {directory}.')
-print(f'Add a Claude provider named HUB Claude with CLAUDE_CONFIG_DIR set to {claude_directory} and binary path set to {wrapper}.')
+print('The next step registers the providers and current hub models in T3 Code automatically.')
+print(f'HUB Codex settings: CODEX_HOME = {directory}.')
+print(f'HUB Claude settings: CLAUDE_CONFIG_DIR = {claude_directory}; binary path = {wrapper}.')
 print('Claude starts working once a Claude account is shared with you or you connect your own.')
 PY
 )

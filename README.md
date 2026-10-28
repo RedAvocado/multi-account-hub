@@ -190,10 +190,46 @@ setup_dir="$(mktemp -d)" && curl -fsS https://hub.your-tailnet.ts.net/setup-prov
 ```
 
 The script writes a private Codex home and a Claude launcher under
-`~/.dittodub-provider-hub`. It prints the T3 Code settings for **HUB Codex**
-and **HUB Claude**, and registers the hub as a T3 usage source. Keep T3 Code
-running and Node.js 22+ installed while it runs. Rerunning it on a connected
-computer only refreshes the usage setup.
+`~/.dittodub-provider-hub`. It registers **HUB Codex** and **HUB Claude** in
+T3 Code, syncs the hub's advertised coding models, and registers the hub as a
+T3 usage source. Keep T3 Code running with Codex and Claude installed, and
+Node.js 22+ available while it runs. Rerunning it on a connected computer
+repairs skills sharing, syncs models, and refreshes usage without consuming
+another setup code or replacing credentials.
+
+Model discovery reads the authenticated hub `/v1/models` endpoint. OpenAI
+coding models go to Codex; Anthropic Claude models go to Claude. Image/audio
+models and internal helpers are excluded from the coding picker. T3's CLI
+catalog can lag behind the hub, especially for API-key connections, so setup
+adds missing models through T3's supported custom-model settings. Existing
+custom models, provider names, launch settings, disabled states, and model
+preferences are preserved. Matching providers are reused by their configured
+home directory. A conflicting provider ID is reported instead of overwritten.
+
+Setup refreshes T3 and checks that the enabled hub providers are ready and
+contain the advertised coding models. Missing CLIs, authentication failures,
+and model discovery failures are reported; resolve them and rerun. Models
+are synchronized on each setup run, not continuously: rerun after new hub
+models or account access are added. The older `setup-hub-usage.cjs` command
+also syncs providers and models; use `setup-provider-hub.sh` to repair skills
+sharing as well. Legacy Codex-only homes remain Codex-only.
+
+The hub providers use the same local skills as the usual installations:
+
+- `~/.dittodub-provider-hub/codex/skills` links to `~/.codex/skills`.
+- `~/.dittodub-provider-hub/claude/skills` links to `~/.claude/skills`.
+
+These links share edits and future additions automatically. Missing source
+folders are created. Only skills folders are shared; provider configuration
+and credentials remain in the separate hub homes. Skills come from the
+computer running T3 Code, including when that computer also hosts the hub.
+
+When upgrading an older installation, an empty or built-in-only hub skills
+folder is backed up under `~/.dittodub-provider-hub/backups` before linking.
+If a hub skills folder contains custom files or links elsewhere, setup stops
+before reading a setup code and explains what to merge or move. Resolve that
+conflict and rerun the script. Start a new conversation afterward to reload
+skills, and refresh T3 Code if the skill picker is stale.
 
 ## Day to day
 
