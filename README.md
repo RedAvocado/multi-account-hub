@@ -1,13 +1,20 @@
 <p align="center"><img src="assets/banner.png" alt="DittoDub logo above the title Multi-Account Hub" width="100%"></p>
 
-One always-on computer holds every Claude and Codex account your team has.
-Every other computer connects to it with its own key: laptops, desktops,
-servers. T3 Code shows each account's remaining usage and lets you spend Codex
-reset credits from its usage panel.
+One always-on computer holds all your Claude and Codex accounts. Every
+computer you work on connects to it with its own key: laptops, desktops,
+servers. T3 Code shows each account's remaining usage and can spend Codex reset
+credits from its usage panel.
 
-Run it as a private hub over **Tailscale**, or add an optional **website**
-where teammates sign in with Google, connect computers and add their own
-accounts.
+It works for one person or for many:
+
+- **Solo.** Sign each account in once, on one machine at home, and use them all
+  from every computer you own.
+- **Many solos, one hub.** Each person connects their own accounts, and those
+  accounts stay theirs: only that person's computers use them. One hub runs
+  everyone's setup, so nobody keeps their own box alive.
+
+Run it privately over **Tailscale**, or add an optional **website** where people
+sign in with Google, connect their computers and add their own accounts.
 
 ## Inspired by T3 Code
 
@@ -18,28 +25,26 @@ lays out the idea:
 - Sign every account into one always-on box at home running
   [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 - Point every machine at it over Tailscale.
-- Let T3 Code read the pooled limits through its **Usage providers** setting.
+- Let T3 Code read each account's limits through its **Usage providers**
+  setting.
 
-It worked so well for one person that we wanted it for a whole team. T3 Code
-shaped the result in three ways:
+We wanted that for several people, each with their own accounts, without
+everyone running a box. T3 Code shaped the result in three ways:
 
-- **Usage where you work.** The hub speaks the same CLIProxy usage API that T3
-  Code's usage panel reads. Each computer sees the accounts it can use, with
-  live limits, reset times and banked Codex resets, and can redeem a reset
-  without leaving T3.
-- **Setup by prompt.** Connecting a computer means pasting one prompt into the
-  coding agent you already use. The agent runs the setup script, which adds
-  **HUB Codex** and **HUB Claude** providers to T3 Code and turns on usage
-  automatically.
+- **Usage where you work.** The hub speaks the CLIProxy usage API that T3 Code's
+  usage panel reads. Each computer sees its accounts' live limits, reset times
+  and banked Codex resets, and can redeem a reset without leaving T3.
+- **Setup by prompt.** To connect a computer, paste one prompt into the coding
+  agent you already use. The agent runs the setup script, which adds **HUB
+  Codex** and **HUB Claude** providers to T3 Code and turns on usage.
 - **Same rules as the guide.** One home machine, no datacenter sign-ins,
   session affinity so prompt caches stay warm, and Codex over WebSockets.
 
-What the hub adds for a team:
+What the hub adds:
 
-- **Personal or shared accounts.** Whoever connects an account decides whether
-  it is personal (only ever used for them) or shared with the team.
-  Administrators choose which shared accounts each person can use, but cannot
-  reach anyone's personal account.
+- **Accounts stay personal.** An account is used only for the person who
+  connected it, and administrators can't change that. Its owner can choose to
+  share it, but nothing is shared by default.
 - **A key per computer.** Every computer gets its own key, and any one can be
   revoked without touching the others. The hub stores only hashes.
 - **Watchdog and alerts.** A cron watchdog restarts stopped services and posts
@@ -47,10 +52,11 @@ What the hub adds for a team:
   attention.
 
 > [!WARNING]
-> Pooling subscriptions may break a provider's terms, and accounts can be
-> banned. Keep Theo's two rules: never use the hub to serve other people's
-> traffic, and use Claude subscriptions only from Claude Code. Run the hub at
-> home, never on a VPS or behind a VPN.
+> Routing subscriptions through a proxy may break a provider's terms, and
+> accounts can be banned. Keep Theo's two rules: use your subscriptions for
+> your own work, never to serve anyone else's traffic, and use Claude
+> subscriptions only from Claude Code. Run the hub at home, never on a VPS or
+> behind a VPN.
 
 <p align="center"><img src="assets/portal.png" alt="The hub website: usage per account and computer setup" width="760"></p>
 
@@ -72,7 +78,7 @@ What the hub adds for a team:
 | --- | --- |
 | `team-gateway.cjs` | The only listener clients reach. Authenticates computer keys, exposes only the model, usage and reset endpoints, and streams without logging bodies. |
 | CLIProxyAPI + key router | Pinned upstream builds with local patches (`upstream/`) so each member can use only the accounts assigned to them. Requests fail closed if routing is unavailable. |
-| `portal/` | Optional website: Google sign-in, setup prompts, connecting accounts, team access and computers. |
+| `portal/` | Optional website: Google sign-in, setup prompts, connecting accounts, access settings and computers. |
 | `hub-admin.py` | Members, computers and account sharing from the hub's terminal. This is everything a Tailscale-only hub needs. |
 | `watchdog.py`, `portal/run-monitor.cjs` | Availability checks, account sign-in health and Discord alerts. |
 | `onboarding/`, `scripts/configure-t3-usage.cjs` | Client setup the hub serves with its own address filled in. |
@@ -161,14 +167,15 @@ python3 hub-admin.py add-member alex alex@example.com --admin
 ./cliproxyapi-auth-helper -config guarded-config.yaml -codex-device-login
 ./cliproxyapi-auth-helper -config guarded-config.yaml -claude-login
 python3 hub-admin.py accounts
-python3 hub-admin.py share codex:you@example.com alex team
+python3 hub-admin.py share codex:alex@example.com alex personal
 python3 hub-admin.py enable alex
 ```
 
-New members automatically get every account shared with the team. A member
-without any accounts starts disabled until one is shared or granted. On your
+A member without any accounts starts disabled until one is connected for
+them, then `enable` turns them on. If an owner has chosen to share an account,
+new members get it automatically. On your
 own record in `gateway-users.json`, set `"owner": true` so nobody can disable
-you from the website. Once the website is running, teammates can connect their
+you from the website. Once the website is running, people can connect their
 own accounts in the browser instead.
 
 **6. Connect computers.**
@@ -191,11 +198,11 @@ computer only refreshes the usage setup.
 ## Day to day
 
 ```bash
-python3 hub-admin.py list                 # members and the accounts they can use
+python3 hub-admin.py list                 # people and the accounts they use
 python3 hub-admin.py devices [alex]       # registered computers
 python3 hub-admin.py revoke-device ID     # cut off one computer
 python3 hub-admin.py disable alex         # cut off a person
-python3 hub-admin.py grant alex claude:team@example.com
+python3 hub-admin.py grant alex claude:alex@example.com
 python3 watchdog.py --verbose             # run every check now
 node issue-login-link.cjs alex@example.com # website: one-time sign-in link
 ```
