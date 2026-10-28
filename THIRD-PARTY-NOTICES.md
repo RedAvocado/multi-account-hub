@@ -13,5 +13,5 @@ library and its dependencies are pinned in `portal/package-lock.json` and
 retain their own licenses when installed.
 
 The DittoDub logo in `portal/public/` and `assets/` comes from the DittoDub press
-kit. The name and logo belong to DittoDub and are not covered by any license
-for this code; replace them in forks.
+kit. The name and logo belong to DittoDub and are not covered by this
+project's MIT license; replace them in forks.

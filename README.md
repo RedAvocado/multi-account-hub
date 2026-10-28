@@ -101,7 +101,7 @@ one dependency, then build the patched proxy, router and sign-in helper.
 `--prepare-only` checks the patches without compiling.
 
 ```bash
-git clone https://github.com/KeystoneScience/multi-account-hub ~/.local/share/cliproxy-hub
+git clone https://github.com/RedAvocado/multi-account-hub ~/.local/share/cliproxy-hub
 cd ~/.local/share/cliproxy-hub
 npm ci --prefix portal --ignore-scripts --no-audit --no-fund
 python3 scripts/build-upstream.py
@@ -242,5 +242,6 @@ sessions, logs and `hub.json` stay local. Upstream sources and licenses are in
 
 ---
 
-Built by [DittoDub](https://dittodub.com). The DittoDub name and logo belong
-to DittoDub; if you fork this, replace them with your own.
+Built by [DittoDub](https://dittodub.com). [MIT licensed](LICENSE). The
+DittoDub name and logo are not covered by the license; if you fork this,
+replace them with your own.

@@ -3,6 +3,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/LICENSE
 !/THIRD-PARTY-NOTICES.md
 !/team-gateway.cjs
 !/hub-admin.py
