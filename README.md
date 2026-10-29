@@ -113,11 +113,25 @@ up to 4× the weight for new sessions. More available credits and nearer
 expirations strengthen the preference, while actual quota and the 3% admission
 reserve still apply. Credit details refresh every five minutes and when the
 available count changes, with a separate 15-minute freshness limit. An uncertain
-count change suppresses the credit bonus. Selection does not redeem credits;
-use the existing reset action to apply them. Account priority and primary/access permissions
-still apply.
+count change suppresses the credit bonus. Account priority and primary/access
+permissions still apply.
 Replacing the plugin resets its in-memory bindings once; normal quota updates
 do not move healthy sessions.
+
+The background monitor automatically redeems available banked Codex reset
+credits 60 seconds before each credit expires, for every connected, enabled
+Codex account, including accounts without member assignments. It discovers
+accounts every 30 seconds, refreshes credit details every five minutes, and
+checks known deadlines every second. Starting or waking inside the final
+minute triggers an immediate attempt. The private `reset-credit-watcher.json`
+stores deadlines and outcomes across restarts. Manual and automatic redemption
+share a stable provider request ID, so retries cannot spend the same credit twice.
+Transient failures and `nothing_to_reset` retry within the remaining minute;
+provider retry hints are honored. Discord reports confirmed redemptions,
+unavailable credits and missed expirations through the existing durable outbox.
+If the provider has nothing to reset, the credit can still expire unused.
+Only a confirmed successful reset followed by verified usable quota clears a
+routing cooldown. This service never buys credits or interrupts model streams.
 
 The website's Usage section shows quota percentage points burned per ten
 minutes (averaged over the last 30 minutes), per hour (last hour), and per day

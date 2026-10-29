@@ -6,6 +6,30 @@ const os = require('node:os');
 const path = require('node:path');
 const {createUsage, parseCodex, parseClaude} = require('./usage-service.cjs');
 
+test('operator reset invalidation refreshes quota and credit details without affecting other accounts', async t => {
+  const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-operator-invalidation-'));
+  t.after(() => fs.rmSync(authDir, {recursive: true, force: true}));
+  const accounts = ['a', 'b'].map(id => ({id: id + '.json', provider: 'codex', email: id + '@example.com'}));
+  for (const a of accounts) fs.writeFileSync(path.join(authDir, a.id), JSON.stringify({type: 'codex', email: a.email, account_id: a.id[0]}));
+  const reads = [], now = Date.parse('2026-10-29T18:00:00Z'); let used = 100;
+  const service = createUsage({authDir, details: false, routingCredits: true, now: () => now,
+    admin: {snapshot: async () => ({accounts, users: [{enabled: true, editable: true, accounts: accounts.map(a => a.id)}]})},
+    management: async (endpoint, input) => {
+      if (endpoint === 'auth-files') return {files: accounts.map(a => ({id: a.id, type: 'codex', auth_index: a.id[0]}))};
+      reads.push(input.auth_index);
+      return {status_code: 200, body: JSON.stringify(input.url.endsWith('/usage') ? {
+        rate_limit: {primary_window: {used_percent: used, limit_window_seconds: 604800}}, rate_limit_reset_credits: {available_count: used ? 1 : 0},
+      } : {available_count: used ? 1 : 0, credits: used ? [{id: 'credit', status: 'available', reset_type: 'codex_rate_limits', expires_at: '2026-10-30T18:00:00Z'}] : []})};
+    }});
+  await service.getForRouting(); assert.equal(reads.length, 4);
+  used = 0; service.invalidateAccount('a.json');
+  const snapshot = await service.getForRouting();
+  assert.equal(snapshot.accounts['a.json'].windows[0].remaining, 100);
+  assert.equal(snapshot.accounts['a.json'].resetCredits.availableCount, 0);
+  assert.equal(snapshot.accounts['b.json'].windows[0].remaining, 0);
+  assert.deepEqual(reads.slice(4), ['a', 'a']);
+});
+
 test('usage parsers report remaining rather than used and do not invent missing quotas', () => {
   const codex = parseCodex({plan_type: 'pro', rate_limit: {
     primary_window: {limit_window_seconds: 604800, used_percent: 75, reset_at: 1793600591},

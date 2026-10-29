@@ -303,7 +303,13 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
         windows: status.value.windows, ...(status.value.resetCredits ? {resetCredits: status.value.resetCredits} : {})}]];
     }))};
   }
-  return {getForUser, listForUser, resetCredits, getForRouting};
+  function invalidateAccount(id) {
+    for (const key of new Set([...cache.keys(), ...creditCache.keys(), ...pending.keys(), ...generations.keys()])) {
+      if (JSON.parse(key)[0] !== id) continue;
+      cache.delete(key); creditCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
+    }
+  }
+  return {getForUser, listForUser, resetCredits, getForRouting, invalidateAccount};
 }
 
 module.exports = {createUsage, parseCodex, parseClaude, managementClient};

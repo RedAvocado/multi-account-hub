@@ -134,4 +134,4 @@ function createResetCredits({resolve, management, invalidate, now = Date.now}) {
   return {getForUser, consume, clearCooldown};
 }
 
-module.exports = {createResetCredits, ResetError, CREDIT_URL, sanitizeCredits};
+module.exports = {createResetCredits, ResetError, CREDIT_URL, USAGE_URL, sanitizeCredits, redemptionId, contextKey};

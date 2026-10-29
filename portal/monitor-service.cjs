@@ -272,6 +272,6 @@ function createMonitor({directory,authDir,hubUrl='',management=managementClient(
     const queue=fs.readdirSync(outbox).filter(x=>/^[a-z0-9-]+\.json$/.test(x));
     return {queued:queue.length,accounts:Object.values(state.accounts).length,incidents:Object.values(state.accounts).filter(a=>a.incident).length};
   }
-  return {scanDevices,flush,checkHealth,status,enqueue};
+  return {scanDevices,flush,checkHealth,status,enqueue,accountLabel};
 }
 module.exports={createMonitor,managementClient,discordDelivery,enqueueDeviceEvent};
