@@ -8,6 +8,7 @@ const {OAuth2Client} = require('google-auth-library');
 const {createPortal} = require('./portal-service.cjs');
 const {createAdministration} = require('./admin-service.cjs');
 const {createUsage} = require('./usage-service.cjs');
+const {createUsageHistory} = require('./usage-history-service.cjs');
 const {createProviderConnect} = require('./provider-connect-service.cjs');
 const {createDevices} = require('./device-service.cjs');
 const {enqueueDeviceEvent} = require('./monitor-service.cjs');
@@ -46,7 +47,7 @@ const oauth = {
 };
 const authDir = path.join(process.env.HOME, '.cli-proxy-api');
 const admin = createAdministration({directory, authDir});
-const usage = createUsage({admin, authDir});
+const usage = createUsage({admin, authDir, history: createUsageHistory({directory})});
 const devices = createDevices({directory});
 const providerConnect = createProviderConnect({directory,admin});
 const server = createPortal({directory, origin, callbackOrigin, callbackPath, workspaceDomain: hub.portal.workspaceDomain,

@@ -119,6 +119,14 @@ still apply.
 Replacing the plugin resets its in-memory bindings once; normal quota updates
 do not move healthy sessions.
 
+The website's Usage section shows quota percentage points burned per ten
+minutes (averaged over the last 30 minutes), per hour (last hour), and per day
+(last 24 hours). Each account uses its longest general quota window so overlapping
+limits are not added together. The monitor samples in the background and keeps
+one day of private history across restarts. Refills, reset crossings and gaps
+longer than three minutes are excluded. Rates start after five observed minutes;
+partial windows show their observed duration as history builds.
+
 ## Choose a mode
 
 |  | Tailscale only | Website |

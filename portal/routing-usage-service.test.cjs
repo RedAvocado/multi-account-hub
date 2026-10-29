@@ -33,3 +33,14 @@ test('routing feed refreshes once, replaces atomically, and keeps the last snaps
     assert.deepEqual(fs.readdirSync(directory),['routing-usage.json']);
   } finally {fs.rmSync(directory,{recursive:true,force:true});}
 });
+
+test('history failures cannot prevent the routing snapshot from updating', async () => {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'routing-history-failure-'));
+  const snapshot={version:1,accounts:{}};
+  const service=createRoutingUsage({directory,usage:{async getForRouting(){return snapshot;}},
+    history:{record(){throw Error('disk unavailable');}}});
+  try {
+    await service.refresh();
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory,'routing-usage.json'),'utf8')),snapshot);
+  } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});

@@ -51,12 +51,16 @@ test('usage respects exact account grants, hides personal information, caches re
     if (input.url.includes('reset-credits')) return {status_code:200,body:JSON.stringify({available_count:2,credits:[{status:'available',expires_at:'2026-11-06T12:00:00Z'},{status:'used',expires_at:'2026-11-01T12:00:00Z'}]})};
     return {status_code:200,body:JSON.stringify({will_renew:true,entitlement:{renews_at:'2026-11-07T12:00:00Z'}})};
   };
-  const usage = createUsage({admin, authDir, management, now:()=>clock});
+  const historyReads=[];
+  const burnRates={basis:'1w',tenMinutes:{percent:1,observedSeconds:1800,windowSeconds:1800}};
+  const usage = createUsage({admin, authDir, management, now:()=>clock,history:{get(id,provider){historyReads.push([id,provider]);return burnRates;}}});
   const jordan = {name:'jordan', email:'jordan@example.org'};
   try {
     const first = await usage.getForUser(jordan);
     assert.equal(first.accounts.length, 1);
     assert.equal(first.accounts[0].windows[0].remaining, 60);
+    assert.deepEqual(first.accounts[0].burnRates,burnRates);
+    assert.deepEqual(historyReads,[['work.json','codex']],'only currently authorized account history is read');
     assert.equal(first.accounts[0].resetExpirations.length, 1);
     assert.equal(first.accounts[0].renewsAt, '2026-11-07T12:00:00.000Z');
     assert.ok(!JSON.stringify(first).includes('owner-private'));
@@ -80,8 +84,10 @@ test('usage respects exact account grants, hides personal information, caches re
     const pending = usage.getForUser(jordan);
     while (!release.resolve) await new Promise(resolve => setImmediate(resolve));
     users[1].accounts = [];
+    const readsBeforeRevocation=historyReads.length;
     release.resolve(); release = null;
     assert.equal((await pending).accounts.length, 0);
+    assert.equal(historyReads.length,readsBeforeRevocation,'permission recheck must happen before reading history');
     const riley = await usage.getForUser({name:'riley',email:'riley@example.org'});
     assert.equal(riley.accounts.length, 2);
     assert.ok(riley.accounts.some(a => a.email === 'owner-private@example.net'));

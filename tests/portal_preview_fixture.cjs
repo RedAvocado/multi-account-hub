@@ -26,9 +26,11 @@ const admin = {async snapshot() {return data;}, async setPermissions(input) {dat
   async mine(current) {return {version:data.version,accounts:data.accounts.filter(a=>a.owner===current.name && !a.disabled)};},
   async setVisibility(current,input) {data.accounts.find(a=>a.id===input.id).visibility=input.visibility;return {ok:true};}};
 const usage = {async getForUser() {return {accounts: [
-  {provider:'codex',email:'work@example.com',plan:'pro',organization:'',windows:[{label:'1w',remaining:56,resetsAt:'2026-11-01T19:00:00Z'}],bankedResets:2,resetExpirations:['2026-11-03T19:00:00Z'],renewsAt:'2026-11-07T19:00:00Z',checkedAt:new Date().toISOString(),stale:false},
+  {provider:'codex',email:'work@example.com',plan:'pro',organization:'',windows:[{label:'1w',remaining:56,resetsAt:'2026-11-01T19:00:00Z'}],bankedResets:2,resetExpirations:['2026-11-03T19:00:00Z'],renewsAt:'2026-11-07T19:00:00Z',checkedAt:new Date().toISOString(),stale:false,
+    burnRates:{basis:'1w',stale:false,tenMinutes:{percent:2.4,observedSeconds:1800,windowSeconds:1800},hour:{percent:12.7,observedSeconds:3600,windowSeconds:3600},day:{percent:108.3,observedSeconds:86400,windowSeconds:86400}}},
   {provider:'codex',email:'personal@example.com',plan:'pro',organization:'',windows:[{label:'1w',remaining:9,resetsAt:'2026-11-01T19:00:00Z'}],bankedResets:2,resetExpirations:[],renewsAt:null,checkedAt:new Date().toISOString(),stale:false},
-  {provider:'claude',email:'work@example.com',displayName:'Team Claude',plan:'Max',organization:"work@example.com's Organization",windows:[{label:'5h',remaining:92,resetsAt:'2026-10-27T19:00:00Z'},{label:'1w',remaining:65,resetsAt:'2026-11-01T19:00:00Z'}],bankedResets:null,resetExpirations:[],renewsAt:null,checkedAt:new Date().toISOString(),stale:false},
+  {provider:'claude',email:'work@example.com',displayName:'Team Claude',plan:'Max',organization:"work@example.com's Organization",windows:[{label:'5h',remaining:92,resetsAt:'2026-10-27T19:00:00Z'},{label:'1w',remaining:65,resetsAt:'2026-11-01T19:00:00Z'}],bankedResets:null,resetExpirations:[],renewsAt:null,checkedAt:new Date().toISOString(),stale:false,
+    burnRates:{basis:'1w',stale:false,tenMinutes:{percent:0.3,observedSeconds:1080,windowSeconds:1800},hour:{percent:1.8,observedSeconds:1080,windowSeconds:3600},day:{percent:43.2,observedSeconds:1080,windowSeconds:86400}}},
 ]};}};
 let providerState = {status:'idle'};
 const providerConnect = {

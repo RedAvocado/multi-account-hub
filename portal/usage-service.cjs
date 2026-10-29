@@ -97,7 +97,7 @@ function parseClaude(body, {precise = false} = {}) {
 
 const accountId = account => crypto.createHash('sha256').update(JSON.stringify([account.id, account.provider, account.email])).digest('hex');
 
-function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now, details = true, routingCredits = false}) {
+function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now, details = true, routingCredits = false, history}) {
   const cache = new Map();
   const creditCache = new Map();
   const pending = new Map();
@@ -276,6 +276,7 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       return [{id: accountId(account), provider: account.provider, email: account.email, organization: account.organization, displayName: account.displayName || '',
         ...(status.value || {plan: null, windows: [], bankedResets: null, resetExpirations: [], renewsAt: null}),
         windows: (status.value?.windows || []).map(({label,remaining,resetsAt}) => ({label,remaining: Math.round(remaining * 10) / 10,resetsAt})),
+        ...(history ? {burnRates: history.get(account.id, account.provider)} : {}),
         checkedAt: status.checkedAt ? new Date(status.checkedAt).toISOString() : null,
         stale: status.failed || (status.checkedAt !== null && now() - status.checkedAt >= MAX_AGE)}];
     })};

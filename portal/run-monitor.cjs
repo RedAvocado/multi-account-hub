@@ -6,13 +6,14 @@ const {loadHubConfig}=require('./hub-config.cjs');
 const {createAdministration}=require('./admin-service.cjs');
 const {createUsage}=require('./usage-service.cjs');
 const {createRoutingUsage}=require('./routing-usage-service.cjs');
+const {createUsageHistory}=require('./usage-history-service.cjs');
 process.umask(0o077);
 const directory=path.join(process.env.HOME,'.local/share/cliproxy-hub');
 const authDir=path.join(process.env.HOME,'.cli-proxy-api');
 const hub=loadHubConfig(directory);
 // Alerts link to the website when there is one; otherwise to the admin CLI.
 const monitor=createMonitor({directory,authDir,hubUrl:hub.portal?hub.hubUrl+'/':''});
-const routingUsage=createRoutingUsage({directory,usage:createUsage({
+const routingUsage=createRoutingUsage({directory,history:createUsageHistory({directory}),usage:createUsage({
   admin:createAdministration({directory,authDir}),authDir,details:false,routingCredits:true,
 })});
 let stopped=false;

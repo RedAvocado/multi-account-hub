@@ -105,6 +105,27 @@ if (usageList && refreshUsage) {
       metrics.append(element('p', `${account.stale ? 'Update unavailable · Last checked' : 'Checked'} ${date(account.checkedAt)}`, 'usage-checked'));
     }
     card.append(metrics);
+    const rates = element('div', undefined, 'usage-burn');
+    const burn = account.burnRates;
+    const basisNames = {'1w': 'Weekly', '1mo': 'Monthly', '5h': '5-hour'};
+    rates.append(element('p', `${basisNames[burn?.basis] || 'Quota'} burn`, 'usage-burn-heading'));
+    const values = element('div', undefined, 'usage-burn-values');
+    const duration = seconds => seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h` : `${Math.floor(seconds / 60)}m`;
+    for (const [key, label, average] of [['tenMinutes', '10 min', '30m average'], ['hour', 'Hour', '1h average'], ['day', 'Day', '24h average']]) {
+      const entry = burn?.[key];
+      const value = entry?.percent;
+      const available = !burn?.stale && typeof value === 'number' && Number.isFinite(value) && value >= 0;
+      const column = element('div', undefined, 'usage-burn-column');
+      column.append(element('span', label, 'usage-burn-label'));
+      column.append(element('strong', available ? `${value > 0 ? '−' : ''}${value.toFixed(value > 0 && value < 1 ? 2 : 1)}%` : '—', 'usage-burn-value'));
+      const partial = entry && entry.observedSeconds < entry.windowSeconds * 0.95;
+      column.append(element('span', available && partial ? `${duration(entry.observedSeconds)} observed` : average, 'usage-burn-average'));
+      column.title = available ? `${basisNames[burn.basis]} quota percentage points burned per ${label.toLowerCase()}; ${duration(entry.observedSeconds)} observed in the last ${duration(entry.windowSeconds)}. Refills and gaps are excluded.` :
+        burn?.stale ? 'Waiting for a fresh usage observation.' : 'Collecting usage history; rates appear after five minutes of observations.';
+      values.append(column);
+    }
+    rates.append(values);
+    card.append(rates);
     return card;
   }
   async function loadUsage(refresh = false) {
@@ -134,7 +155,7 @@ if (usageList && refreshUsage) {
   refreshUsage.addEventListener('click', () => loadUsage(true));
   document.addEventListener('hub:accounts-changed', () => loadUsage(true));
   loadUsage();
-  setInterval(loadUsage, 5 * 60 * 1000);
+  setInterval(() => { if (!document.hidden) loadUsage(); }, 60 * 1000);
 }
 
 const providerForm = document.querySelector('#provider-start-form');

@@ -5,7 +5,7 @@ const crypto = require('node:crypto');
 
 // Scheduling reads this local snapshot, never a provider endpoint on the
 // request path. Atomic replacement prevents readers seeing half-written JSON.
-function createRoutingUsage({directory, usage}) {
+function createRoutingUsage({directory, usage, history}) {
   let pending;
   function refresh() {
     if (pending) return pending;
@@ -18,6 +18,8 @@ function createRoutingUsage({directory, usage}) {
       } finally {
         try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
+      // History is optional telemetry; a write failure must not disrupt quota routing.
+      try { history?.record(snapshot); } catch (_) {}
     }).finally(() => { pending = undefined; });
     return pending;
   }
