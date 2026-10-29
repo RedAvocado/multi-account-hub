@@ -306,4 +306,4 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
   return {getForUser, listForUser, resetCredits, getForRouting};
 }
 
-module.exports = {createUsage, parseCodex, parseClaude};
+module.exports = {createUsage, parseCodex, parseClaude, managementClient};

@@ -127,6 +127,18 @@ one day of private history across restarts. Refills, reset crossings and gaps
 longer than three minutes are excluded. Rates start after five observed minutes;
 partial windows show their observed duration as history builds.
 
+The monitor also checks Claude's paid extra usage setting. It discovers
+connected Claude accounts every minute, including disabled or unassigned ones,
+and checks each account's provider setting every five minutes. For Pro and Max
+accounts, it disables extra usage if enabled and verifies the change. Anthropic
+does not expose that switch for Team accounts through this OAuth API: an enabled
+Team setting is recorded as `team_admin_required` for a Team admin to change.
+The monitor never enables billing or buys credits. Failed checks use bounded
+retries and remain explicitly unverified in
+the private `claude-extra-usage-policy.json` status file; they do not interrupt
+model streams. This periodic check cannot prevent a charge between someone
+enabling extra usage outside the hub and the next successful check.
+
 ## Choose a mode
 
 |  | Tailscale only | Website |
