@@ -85,6 +85,40 @@ What the hub adds:
 | `watchdog.py`, `portal/run-monitor.cjs` | Availability checks, account sign-in health and Discord alerts. |
 | `onboarding/`, `scripts/configure-t3-usage.cjs` | Client setup the hub serves with its own address filled in. |
 
+### Choosing an account
+
+New sessions use a weighted choice among the member's permitted, available
+accounts. More remaining quota gets more weight; an approaching quota reset
+adds a small bonus. Every applicable window counts, so an empty weekly quota
+cannot be offset by a full five-hour quota. Claude model-specific limits apply
+only to that model family; Cowork limits do not constrain coding requests.
+
+The selection keeps a 3% reserve for existing sessions when healthier accounts
+are available. Healthy sessions stay on the same account for prompt caching,
+with a one-hour idle timeout. At an observed, unrounded zero, subsequent
+requests move to another permitted account. A provider quota rejection before
+streaming also retries another available account. Responses already streaming
+are not replayed, which avoids duplicate output or tool calls.
+
+The monitor refreshes private quota data roughly once a minute into
+`routing-usage.json`; selection makes no provider calls. Observations older
+than three minutes become unknown, rather than looking like unlimited quota
+or locking users out. Unknown accounts together receive at most 20% of new
+sessions when known healthy alternatives exist. Missing telemetry preserves
+existing session bindings and falls back to equal weighting for new sessions.
+
+Weights use relative percentages, without guessing different plans' token
+capacities. Accounts with banked Codex resets expiring within seven days receive
+up to 4× the weight for new sessions. More available credits and nearer
+expirations strengthen the preference, while actual quota and the 3% admission
+reserve still apply. Credit details refresh every five minutes and when the
+available count changes, with a separate 15-minute freshness limit. An uncertain
+count change suppresses the credit bonus. Selection does not redeem credits;
+use the existing reset action to apply them. Account priority and primary/access permissions
+still apply.
+Replacing the plugin resets its in-memory bindings once; normal quota updates
+do not move healthy sessions.
+
 ## Choose a mode
 
 |  | Tailscale only | Website |

@@ -4,10 +4,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
-const {createResetCredits, ResetError} = require('./reset-credit-service.cjs');
+const {createResetCredits, ResetError, CREDIT_URL, sanitizeCredits} = require('./reset-credit-service.cjs');
 
 const MAX_AGE = 30 * 1000;
 const RETRY_DELAY = 60 * 1000;
+const CREDIT_MAX_AGE = 5 * 60 * 1000;
 
 // The management API is local only. Neither its credential nor the upstream
 // response is returned to a browser; callers receive sanitized usage fields.
@@ -43,17 +44,17 @@ function timestamp(value) {
   else return null;
   return Number.isFinite(value) && value > 0 && value < 8640000000000000 ? new Date(value).toISOString() : null;
 }
-function percent(value) {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
-    ? Math.round((100 - value) * 10) / 10 : null;
+function percent(value, precise = false) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) return null;
+  return precise ? 100 - value : Math.round((100 - value) * 10) / 10;
 }
-function window(label, value, usedKey, resetKey) {
+function window(label, value, usedKey, resetKey, precise) {
   if (!value || typeof value !== 'object') return null;
-  const remaining = percent(value[usedKey]);
+  const remaining = percent(value[usedKey], precise);
   if (remaining === null) return null;
   return {label, remaining, resetsAt: timestamp(value[resetKey])};
 }
-function parseCodex(body) {
+function parseCodex(body, {precise = false} = {}) {
   const periods = body?.rate_limit;
   const windows = [];
   for (const candidate of [periods?.primary_window, periods?.secondary_window]) {
@@ -62,8 +63,8 @@ function parseCodex(body) {
     const label = seconds === 18000 ? '5h' : seconds === 604800 ? '1w' :
       seconds >= 2419200 && seconds <= 2678400 ? '1mo' : null;
     if (!label) continue;
-    const entry = window(label, candidate, 'used_percent', 'reset_at');
-    if (entry) windows.push(entry);
+    const entry = window(label, candidate, 'used_percent', 'reset_at', precise);
+    if (entry) windows.push({...entry, ...(precise ? {scope:'general',durationSeconds:seconds} : {})});
   }
   const plan = typeof body?.plan_type === 'string' && /^[a-z0-9 _-]{1,30}$/i.test(body.plan_type)
     ? body.plan_type : null;
@@ -71,35 +72,40 @@ function parseCodex(body) {
   return {plan, windows, bankedResets: Number.isSafeInteger(count) && count >= 0 && count <= 1000 ? count : null,
     resetExpirations: [], renewsAt: null};
 }
-function parseClaude(body) {
+function parseClaude(body, {precise = false} = {}) {
   const windows = [];
   for (const [key, label] of [['five_hour','5h'], ['seven_day','1w'], ['seven_day_opus','Opus'],
     ['seven_day_sonnet','Sonnet'], ['seven_day_cowork','Cowork'], ['iguana_necktie','Fable']]) {
     const value = body?.[key];
     // Dollar-based windows are not percentage quotas for a model.
     if (key === 'iguana_necktie' && value && ('limit_dollars' in value || 'used_dollars' in value)) continue;
-    const entry = window(label, value, 'utilization', 'resets_at');
-    if (entry) windows.push(entry);
+    const entry = window(label, value, 'utilization', 'resets_at', precise);
+    if (entry) windows.push({...entry, ...(precise ? {scope:label==='5h'||label==='1w'?'general':label.toLowerCase(),
+      durationSeconds:label==='5h'?18000:604800} : {})});
   }
   if (Array.isArray(body?.limits)) {
     const fable = body.limits.find(x => x?.kind === 'weekly_scoped' &&
       /^fable(?: 5)?$/i.test(x?.scope?.model?.display_name || '') && x.is_active === true);
-    const entry = window('Fable', fable, 'percent', 'resets_at');
-    if (entry) { const index = windows.findIndex(x => x.label === 'Fable'); if (index >= 0) windows[index] = entry; else windows.push(entry); }
+    const entry = window('Fable', fable, 'percent', 'resets_at', precise);
+    if (entry) {
+      if (precise) Object.assign(entry,{scope:'fable',durationSeconds:604800});
+      const index = windows.findIndex(x => x.label === 'Fable'); if (index >= 0) windows[index] = entry; else windows.push(entry);
+    }
   }
   return {plan: null, windows, bankedResets: null, resetExpirations: [], renewsAt: null};
 }
 
 const accountId = account => crypto.createHash('sha256').update(JSON.stringify([account.id, account.provider, account.email])).digest('hex');
 
-function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now}) {
+function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now, details = true, routingCredits = false}) {
   const cache = new Map();
+  const creditCache = new Map();
   const pending = new Map();
   const generations = new Map();
   const usageKey = account => JSON.stringify([account.id, account.provider, account.email, account.personal]);
   const resetCredits = createResetCredits({resolve: resolveCodexAccount, management, now, invalidate(account) {
     const key = usageKey(account);
-    cache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
+    cache.delete(key); creditCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
   }});
   let running = 0;
   const waiting = [];
@@ -151,11 +157,47 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
     }
     return accountContext(current, result.files);
   }
+  async function routingCreditDetails(account, index, header, availableCount) {
+    const key = usageKey(account), generation = generations.get(key) || 0;
+    const previous = creditCache.get(key);
+    // A changed count cannot tell us which expiration was redeemed. Refresh
+    // immediately, or suppress the bonus until consistent details are known.
+    const consistent = value => value && (availableCount === null || availableCount === value.availableCount);
+    if (previous?.value && !consistent(previous.value)) previous.value = null;
+    if (previous && now() - previous.attemptedAt < (previous.failed || !previous.value ? RETRY_DELAY : CREDIT_MAX_AGE) &&
+        (previous.failed || consistent(previous.value))) return consistent(previous.value) ? previous.value : null;
+    try {
+      const body = await upstream(index, CREDIT_URL, {...header, 'OpenAI-Beta': 'codex-1', Originator: 'Codex Desktop'});
+      const credits = sanitizeCredits(body).credits.filter(credit => credit.status === 'available' && Date.parse(credit.expires_at) > now());
+      const count = Number.isSafeInteger(body.available_count) && body.available_count >= 0 && body.available_count <= 1000
+        ? body.available_count : credits.length;
+      const value = {checkedAt: new Date(now()).toISOString(), availableCount: count,
+        expirations: credits.map(credit => credit.expires_at).sort()};
+      if ((generations.get(key) || 0) !== generation) return null;
+      // Do not guess which expiration survived a partial redemption while
+      // provider count/list updates are inconsistent with each other.
+      const accepted = count === credits.length && consistent(value) ? value : null;
+      creditCache.set(key, {value: accepted, attemptedAt: now(), failed: !accepted});
+      return accepted;
+    } catch (_) {
+      if ((generations.get(key) || 0) !== generation) return null;
+      const value = previous?.value || null;
+      creditCache.set(key, {value, attemptedAt: now(), failed: true});
+      return consistent(value) ? value : null; // Retain successful age without reusing uncertain expirations.
+    }
+  }
   async function fetchAccount(account, files) {
     const {index, header} = accountContext(account, files);
     if (account.provider === 'codex') {
-      const result = parseCodex(await upstream(index, 'https://chatgpt.com/backend-api/wham/usage', header));
+      const body = await upstream(index, 'https://chatgpt.com/backend-api/wham/usage', header);
+      const checkedAt = now();
+      const result = parseCodex(body, {precise: true});
       if (!result.windows.length) throw new Error('no usage data');
+      if (routingCredits) {
+        const creditDetails = await routingCreditDetails(account, index, header, result.bankedResets);
+        if (creditDetails) result.resetCredits = creditDetails;
+      }
+      if (!details) return {value: result, checkedAt};
       try {
         const credits = await upstream(index, 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits',
           {...header, 'OpenAI-Beta': 'codex-1', Originator: 'Codex Desktop'});
@@ -169,20 +211,23 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
           result.renewsAt = timestamp(subscription.entitlement?.renews_at || subscription.active_until);
         }
       } catch (_) { /* Optional detail. */ }
-      return result;
+      return {value: result, checkedAt};
     }
     if (account.provider === 'claude') {
       header['User-Agent'] = 'claude-cli/2.1.280 (external, cli)';
       header['anthropic-beta'] = 'oauth-2025-04-20';
-      const result = parseClaude(await upstream(index, 'https://api.anthropic.com/api/oauth/usage', header));
+      const body = await upstream(index, 'https://api.anthropic.com/api/oauth/usage', header);
+      const checkedAt = now();
+      const result = parseClaude(body, {precise: true});
       if (!result.windows.length) throw new Error('no usage data');
+      if (!details) return {value: result, checkedAt};
       try {
         const profile = await upstream(index, 'https://api.anthropic.com/api/oauth/profile', header);
         if (profile.account?.has_claude_max === true) result.plan = 'Max';
         else if (profile.account?.has_claude_pro === true) result.plan = 'Pro';
         else if (profile.organization?.organization_type === 'claude_team') result.plan = 'Team';
       } catch (_) { /* Optional detail. */ }
-      return result;
+      return {value: result, checkedAt};
     }
     throw new Error('unsupported provider');
   }
@@ -200,8 +245,8 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
     const action = limited(async () => {
       try {
         const files = await filesPromise();
-        const value = await fetchAccount(account, files);
-        const record = {value, checkedAt: now(), attemptedAt: now(), failed: false};
+        const {value, checkedAt} = await fetchAccount(account, files);
+        const record = {value, checkedAt, attemptedAt: now(), failed: false};
         return save(record);
       } catch (_) {
         const record = {value: previous?.value || null, checkedAt: previous?.checkedAt || null, attemptedAt: now(), failed: true};
@@ -230,11 +275,34 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       const status = values[index];
       return [{id: accountId(account), provider: account.provider, email: account.email, organization: account.organization, displayName: account.displayName || '',
         ...(status.value || {plan: null, windows: [], bankedResets: null, resetExpirations: [], renewsAt: null}),
+        windows: (status.value?.windows || []).map(({label,remaining,resetsAt}) => ({label,remaining: Math.round(remaining * 10) / 10,resetsAt})),
         checkedAt: status.checkedAt ? new Date(status.checkedAt).toISOString() : null,
         stale: status.failed || (status.checkedAt !== null && now() - status.checkedAt >= MAX_AGE)}];
     })};
   }
-  return {getForUser, listForUser, resetCredits};
+  // Local scheduling data only. Account permissions are still enforced by the
+  // router on every request; quota data never grants access to an account.
+  async function getForRouting() {
+    const allowed = snapshot => snapshot.accounts.filter(account => !account.disabled &&
+      snapshot.users.some(user => user.enabled && user.editable && user.accounts.includes(account.id) &&
+        (!account.personal || account.owner === user.name)));
+    const accounts = allowed(await admin.snapshot());
+    let files;
+    const filesPromise = () => files ||= Promise.resolve().then(() => management('auth-files')).then(result => {
+      if (!Array.isArray(result.files) || result.files.length > 1000) throw new Error('accounts unavailable');
+      return result.files;
+    });
+    const values = await Promise.all(accounts.map(account => accountUsage(account, filesPromise, false)));
+    const current = new Map(allowed(await admin.snapshot()).map(account => [account.id, account]));
+    return {version: 1, accounts: Object.fromEntries(accounts.flatMap((account, i) => {
+      const after = current.get(account.id), status = values[i];
+      if (!after || after.provider !== account.provider || after.email !== account.email ||
+          after.personal !== account.personal || after.owner !== account.owner || !status.value || !status.checkedAt) return [];
+      return [[account.id, {provider: account.provider, checkedAt: new Date(status.checkedAt).toISOString(),
+        windows: status.value.windows, ...(status.value.resetCredits ? {resetCredits: status.value.resetCredits} : {})}]];
+    }))};
+  }
+  return {getForUser, listForUser, resetCredits, getForRouting};
 }
 
 module.exports = {createUsage, parseCodex, parseClaude};

@@ -11,7 +11,7 @@ index 2e159d4..22b997e 100644
  require (
  	github.com/router-for-me/CLIProxyAPI/v8 v8.0.0
 diff --git a/main.go b/main.go
-index 3a3a1b3..bc715d4 100644
+index 3a3a1b3..a4fd6dc 100644
 --- a/main.go
 +++ b/main.go
 @@ -50,7 +50,9 @@ import (
@@ -24,7 +24,16 @@ index 3a3a1b3..bc715d4 100644
  	"unsafe"
  
  	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
-@@ -69,6 +71,19 @@ var configUI []byte
+@@ -58,7 +60,7 @@ import (
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+-const pluginVersion = "0.5.0"
++const pluginVersion = "0.6.1"
+ 
+ // configUIPath is the resource path shown as a menu page in the management panel,
+ // served at /v0/resource/plugins/key-router/config.
+@@ -69,6 +71,18 @@ var configUI []byte
  
  var currentConfig atomic.Value
  
@@ -38,13 +47,12 @@ index 3a3a1b3..bc715d4 100644
 +var affinity = struct {
 +	sync.Mutex
 +	bindings map[string]sessionBinding
-+	cursors  map[string]uint64
-+}{bindings: map[string]sessionBinding{}, cursors: map[string]uint64{}}
++}{bindings: map[string]sessionBinding{}}
 +
  type envelope struct {
  	OK     bool            `json:"ok"`
  	Result json.RawMessage `json:"result,omitempty"`
-@@ -114,8 +129,6 @@ const (
+@@ -114,21 +128,21 @@ const (
  type userRules struct {
  	primary []string
  	access  []string
@@ -53,7 +61,49 @@ index 3a3a1b3..bc715d4 100644
  }
  
  type pluginConfig struct {
-@@ -263,7 +276,6 @@ func compile(cfg pluginConfig) (*routingTable, error) {
+-	Debug bool         `yaml:"debug"`
+-	Users []userConfig `yaml:"users"`
++	Debug     bool         `yaml:"debug"`
++	UsageFile string       `yaml:"usage-file"`
++	Users     []userConfig `yaml:"users"`
+ }
+ 
+ // routingTable is the compiled form of pluginConfig.
+ type routingTable struct {
+-	debug   bool
+-	byKey   map[string]*userConfig
+-	byScope map[string]*userConfig
+-	rules   map[*userConfig]userRules
++	debug     bool
++	usageFile string
++	byKey     map[string]*userConfig
++	byScope   map[string]*userConfig
++	rules     map[*userConfig]userRules
+ }
+ 
+ type registration struct {
+@@ -237,11 +251,16 @@ func configure(raw []byte) error {
+ }
+ 
+ func compile(cfg pluginConfig) (*routingTable, error) {
++	usageFile := strings.TrimSpace(cfg.UsageFile)
++	if usageFile == "" {
++		usageFile = defaultUsageFile()
++	}
+ 	table := &routingTable{
+-		debug:   cfg.Debug,
+-		byKey:   make(map[string]*userConfig),
+-		byScope: make(map[string]*userConfig),
+-		rules:   make(map[*userConfig]userRules),
++		debug:     cfg.Debug,
++		usageFile: usageFile,
++		byKey:     make(map[string]*userConfig),
++		byScope:   make(map[string]*userConfig),
++		rules:     make(map[*userConfig]userRules),
+ 	}
+ 	for i := range cfg.Users {
+ 		user := &cfg.Users[i]
+@@ -263,7 +282,6 @@ func compile(cfg pluginConfig) (*routingTable, error) {
  		rules := userRules{primary: normalizeRules(user.Primary), access: normalizeRules(user.Access)}
  		if len(user.Primary) == 0 && len(user.Access) == 0 && len(user.Auths) > 0 {
  			rules.primary = normalizeRules(user.Auths)
@@ -61,7 +111,19 @@ index 3a3a1b3..bc715d4 100644
  		}
  		table.rules[user] = rules
  	}
-@@ -317,13 +329,12 @@ func pickAuth(raw []byte) ([]byte, error) {
+@@ -290,6 +308,11 @@ func pluginRegistration() registration {
+ 			// Required by the host; the plugin is local, so point at the upstream project.
+ 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+ 			ConfigFields: []pluginapi.ConfigField{
++				{
++					Name:        "usage-file",
++					Type:        pluginapi.ConfigFieldTypeString,
++					Description: "Local quota snapshot; defaults to ~/.local/share/cliproxy-hub/routing-usage.json. Missing or stale data falls back to session-aware routing.",
++				},
+ 				{
+ 					Name:        "users",
+ 					Type:        pluginapi.ConfigFieldTypeArray,
+@@ -317,17 +340,22 @@ func pickAuth(raw []byte) ([]byte, error) {
  	}
  	table := loadedConfig()
  	if table == nil || len(table.byKey) == 0 {
@@ -77,20 +139,30 @@ index 3a3a1b3..bc715d4 100644
  	}
  
  	var primary, access []pluginapi.SchedulerAuthCandidate
-@@ -335,18 +346,14 @@ func pickAuth(raw []byte) ([]byte, error) {
++	now := time.Now()
++	quotas := readQuotaSnapshot(table.usageFile, now)
++	req.Model = canonicalModel(req.Model)
+ 	for _, candidate := range req.Candidates {
++		if remaining, known := quotaHeadroom(candidate, req.Model, quotas, now); known && remaining == 0 {
++			continue
++		}
+ 		switch table.tier(user, candidate) {
+ 		case tierPrimary:
+ 			primary = append(primary, candidate)
+@@ -335,18 +363,10 @@ func pickAuth(raw []byte) ([]byte, error) {
  			access = append(access, candidate)
  		}
  	}
 -	if pick, ok := best(primary); ok {
-+	if pick, ok := bestForSession(user, req, primary); ok {
- 		logf(table, "user=%s model=%s: primary %s", user.Name, req.Model, pick)
+-		logf(table, "user=%s model=%s: primary %s", user.Name, req.Model, pick)
++	if pick, ok := bestForSession(user, req, primary, access, quotas, now); ok {
++		logf(table, "user=%s model=%s: selected %s", user.Name, req.Model, pick)
  		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
  	}
 -	if pick, ok := best(access); ok {
-+	if pick, ok := bestForSession(user, req, access); ok {
- 		logf(table, "user=%s model=%s: no primary available, access %s", user.Name, req.Model, pick)
- 		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
- 	}
+-		logf(table, "user=%s model=%s: no primary available, access %s", user.Name, req.Model, pick)
+-		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
+-	}
 -	if table.rules[user].unrestricted {
 -		logf(table, "user=%s model=%s: no own account available, built-in routing over %d candidate(s)", user.Name, req.Model, len(req.Candidates))
 -		return unhandled()
@@ -98,23 +170,39 @@ index 3a3a1b3..bc715d4 100644
  	logf(table, "user=%s model=%s: rejected, none of %d candidate(s) is allowed", user.Name, req.Model, len(req.Candidates))
  	return okEnvelope(pluginapi.SchedulerPickResponse{
  		Handled:      true,
-@@ -356,8 +363,7 @@ func pickAuth(raw []byte) ([]byte, error) {
+@@ -356,18 +376,114 @@ func pickAuth(raw []byte) ([]byte, error) {
  	})
  }
  
 -// best picks fill-first: highest priority, then stable ID order.
 -func best(candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
-+func bestForSession(user *userConfig, req pluginapi.SchedulerPickRequest, candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
- 	if len(candidates) == 0 {
+-	if len(candidates) == 0 {
++func bestForSession(user *userConfig, req pluginapi.SchedulerPickRequest, primary, access []pluginapi.SchedulerAuthCandidate, quotas quotaSnapshot, now time.Time) (string, bool) {
++	if len(primary) == 0 && len(access) == 0 {
  		return "", false
  	}
-@@ -367,7 +373,68 @@ func best(candidates []pluginapi.SchedulerAuthCandidate) (string, bool) {
++	candidates := primary
++	if len(candidates) == 0 {
++		candidates = access
++	}
+ 	sort.SliceStable(candidates, func(i, j int) bool {
+ 		if candidates[i].Priority != candidates[j].Priority {
+ 			return candidates[i].Priority > candidates[j].Priority
  		}
  		return candidates[i].ID < candidates[j].ID
  	})
 -	return candidates[0].ID, true
 +	session := ""
++	// The host's canonical identity wins. Explicit fallback headers must
++	// precede generated identities because the host does not recognize every
++	// client's session header (for example, X-Codex-Session-Id).
++	if value, ok := req.Options.Metadata["canonical_session_id"].(string); ok {
++		session = strings.TrimSpace(value)
++	}
 +	for _, wanted := range []string{"session-id", "session_id", "x-session-id", "thread-id", "x-codex-session-id"} {
++		if session != "" {
++			break
++		}
 +		for key, values := range req.Options.Headers {
 +			if strings.EqualFold(key, wanted) && len(values) > 0 {
 +				session = strings.TrimSpace(values[0])
@@ -125,28 +213,38 @@ index 3a3a1b3..bc715d4 100644
 +			break
 +		}
 +	}
-+	if session == "" {
-+		for _, key := range []string{"canonical_session_id", "execution_session_id", "derived_session_id"} {
-+			if value, ok := req.Options.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
-+				session = strings.TrimSpace(value)
-+				break
-+			}
++	for _, name := range []string{"execution_session_id", "derived_session_id"} {
++		if session != "" {
++			break
++		}
++		if value, ok := req.Options.Metadata[name].(string); ok {
++			session = strings.TrimSpace(value)
 +		}
 +	}
-+	if session == "" {
-+		// Without a reliable session identity, preserve upstream's fill-first
-+		// behavior instead of changing credentials on every tool call.
-+		return candidates[0].ID, true
-+	}
 +	group := user.Name + "\x00" + req.Provider + "\x00" + req.Model
-+	digest := sha256.Sum256([]byte(group + "\x00" + session))
++	identity := "session\x00" + session
++	if session == "" {
++		identity = "anonymous"
++	}
++	digest := sha256.Sum256([]byte(group + "\x00" + identity))
 +	key := hex.EncodeToString(digest[:])
-+	now := time.Now()
 +	affinity.Lock()
 +	defer affinity.Unlock()
 +	if binding, ok := affinity.bindings[key]; ok && now.Before(binding.expires) {
-+		for _, candidate := range candidates {
++		// A healthy fallback session remains warm when a primary recovers.
++		// Primary preference governs new bindings, not every tool call.
++		for _, candidate := range primary {
 +			if candidate.ID == binding.authID {
++				binding.expires = now.Add(time.Hour)
++				affinity.bindings[key] = binding
++				return candidate.ID, true
++			}
++		}
++		for _, candidate := range access {
++			// Retain equivalent OAuth subscriptions across primary recovery;
++			// paid API-key fallbacks retain primary-before-access semantics.
++			oauth := (candidate.Provider == "codex" || candidate.Provider == "claude") && strings.HasSuffix(candidate.ID, ".json") && !strings.Contains(candidate.ID, ":apikey:")
++			if candidate.ID == binding.authID && (len(primary) == 0 || oauth) {
 +				binding.expires = now.Add(time.Hour)
 +				affinity.bindings[key] = binding
 +				return candidate.ID, true
@@ -160,25 +258,38 @@ index 3a3a1b3..bc715d4 100644
 +			}
 +		}
 +		if len(affinity.bindings) >= 4096 {
-+			// Hard cap prevents unbounded memory use from untrusted sessions.
-+			for existing := range affinity.bindings {
-+				delete(affinity.bindings, existing)
-+				break
++			oldest := ""
++			var expires time.Time
++			for existing, binding := range affinity.bindings {
++				if oldest == "" || binding.expires.Before(expires) {
++					oldest, expires = existing, binding.expires
++				}
 +			}
++			delete(affinity.bindings, oldest)
 +		}
 +	}
 +	eligible := 1
 +	for eligible < len(candidates) && candidates[eligible].Priority == candidates[0].Priority {
 +		eligible++
 +	}
-+	choice := candidates[affinity.cursors[group]%uint64(eligible)].ID
-+	affinity.cursors[group]++
++	choice := weightedAccount(candidates[:eligible], req.Model, key, quotas, now)
++	if choice == "" {
++		return "", false
++	}
 +	affinity.bindings[key] = sessionBinding{authID: choice, expires: now.Add(time.Hour)}
 +	return choice, true
++}
++
++func canonicalModel(model string) string {
++	model = strings.ToLower(strings.TrimSpace(model))
++	if i := strings.LastIndex(model, "("); i > 0 && strings.HasSuffix(model, ")") {
++		model = strings.TrimSpace(model[:i])
++	}
++	return model
  }
  
  // tier classifies an account for a user; primary wins over access.
-@@ -388,6 +455,12 @@ func matchesAny(rules []string, candidate pluginapi.SchedulerAuthCandidate) bool
+@@ -388,6 +504,12 @@ func matchesAny(rules []string, candidate pluginapi.SchedulerAuthCandidate) bool
  	note := strings.ToLower(candidate.Attributes["note"])
  	provider := strings.ToLower(candidate.Provider)
  	for _, rule := range rules {
@@ -191,7 +302,7 @@ index 3a3a1b3..bc715d4 100644
  		if ruleProvider, identity, scoped := strings.Cut(rule, ":"); scoped {
  			if ruleProvider == provider && containsToken(id, identity) {
  				return true
-@@ -429,9 +502,7 @@ func isIdentityChar(c byte) bool {
+@@ -429,9 +551,7 @@ func isIdentityChar(c byte) bool {
  // ?key=). Request headers are a fallback for hosts without caller_scope.
  func (t *routingTable) userFor(opts pluginapi.SchedulerOptions) *userConfig {
  	if scope, _ := opts.Metadata["caller_scope"].(string); scope != "" {
@@ -202,7 +313,7 @@ index 3a3a1b3..bc715d4 100644
  	}
  	get := func(name string) string {
  		for key, values := range opts.Headers {
-@@ -480,8 +551,9 @@ func handleManagement(raw []byte) ([]byte, error) {
+@@ -480,8 +600,9 @@ func handleManagement(raw []byte) ([]byte, error) {
  	})
  }
  
@@ -215,10 +326,34 @@ index 3a3a1b3..bc715d4 100644
  
  func loadedConfig() *routingTable {
 diff --git a/router_test.go b/router_test.go
-index fa63e3d..9b1bc16 100644
+index fa63e3d..61cf0f5 100644
 --- a/router_test.go
 +++ b/router_test.go
-@@ -96,21 +96,67 @@ func TestPrimaryWinsOverAccess(t *testing.T) {
+@@ -24,6 +24,9 @@ users:
+ 
+ func configureForTest(t *testing.T) {
+ 	t.Helper()
++	affinity.Lock()
++	affinity.bindings = map[string]sessionBinding{}
++	affinity.Unlock()
+ 	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(testConfig)})
+ 	if err := configure(raw); err != nil {
+ 		t.Fatalf("configure: %v", err)
+@@ -32,7 +35,12 @@ func configureForTest(t *testing.T) {
+ 
+ func pick(t *testing.T, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
+ 	t.Helper()
+-	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: "m", Options: opts, Candidates: candidates})
++	return pickModel(t, "m", opts, candidates...)
++}
++
++func pickModel(t *testing.T, model string, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
++	t.Helper()
++	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: model, Options: opts, Candidates: candidates})
+ 	out, err := pickAuth(raw)
+ 	if err != nil {
+ 		t.Fatalf("pickAuth: %v", err)
+@@ -96,21 +104,88 @@ func TestPrimaryWinsOverAccess(t *testing.T) {
  	}
  }
  
@@ -281,7 +416,7 @@ index fa63e3d..9b1bc16 100644
 +	}
 +	first := pick(t, options("one"), personal, a, b)
 +	second := pick(t, options("two"), personal, a, b)
-+	if first.Reject || second.Reject || first.AuthID == second.AuthID || first.AuthID == "personal" || second.AuthID == "personal" {
++	if first.Reject || second.Reject || first.AuthID == "personal" || second.AuthID == "personal" {
 +		t.Fatalf("sessions were not distributed across permitted accounts: %+v %+v", first, second)
 +	}
 +	if again := pick(t, options("one"), personal, b, a); again.AuthID != first.AuthID {
@@ -289,6 +424,687 @@ index fa63e3d..9b1bc16 100644
 +	}
 +	if lostWork := pick(t, options("one"), personal); !lostWork.Reject {
 +		t.Fatalf("team session fell back to personal account: %+v", lostWork)
++	}
++}
++
++func TestHealthyFallbackSessionStaysWarmWhenPrimaryRecovers(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: recovered-primary-test, api-keys: [k], primary: [id=work-primary.json], access: [id=work-fallback.json]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	primary := pluginapi.SchedulerAuthCandidate{ID: "work-primary.json", Provider: "codex"}
++	fallback := pluginapi.SchedulerAuthCandidate{ID: "work-fallback.json", Provider: "codex"}
++	opts := scope("k")
++	opts.Headers = map[string][]string{"Session-Id": {"warm-fallback"}}
++	if got := pick(t, opts, fallback); got.AuthID != fallback.ID {
++		t.Fatalf("expected fallback during primary outage: %+v", got)
++	}
++	if got := pick(t, opts, primary, fallback); got.AuthID != fallback.ID {
++		t.Fatalf("primary recovery must not disrupt an active cache: %+v", got)
++	}
++	opts.Headers["Session-Id"] = []string{"new-session"}
++	if got := pick(t, opts, primary, fallback); got.AuthID != primary.ID {
++		t.Fatalf("new sessions must still honor primary preference: %+v", got)
  	}
  }
  
+diff --git a/quota.go b/quota.go
+new file mode 100644
+index 0000000..8015f4c
+--- /dev/null
++++ b/quota.go
+@@ -0,0 +1,252 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"math"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++const quotaMaxAge = 3 * time.Minute
++
++type quotaWindow struct {
++	Label           string     `json:"label"`
++	Scope           string     `json:"scope"`
++	DurationSeconds int        `json:"durationSeconds"`
++	Remaining       *float64   `json:"remaining"`
++	ResetsAt        *time.Time `json:"resetsAt"`
++}
++
++type accountQuota struct {
++	Provider     string        `json:"provider"`
++	CheckedAt    time.Time     `json:"checkedAt"`
++	Windows      []quotaWindow `json:"windows"`
++	ResetCredits *resetCredits `json:"resetCredits,omitempty"`
++}
++
++type resetCredits struct {
++	CheckedAt      time.Time   `json:"checkedAt"`
++	AvailableCount int         `json:"availableCount"`
++	Expirations    []time.Time `json:"expirations"`
++}
++
++type quotaSnapshot struct {
++	Version  int                     `json:"version"`
++	Accounts map[string]accountQuota `json:"accounts"`
++}
++
++var quotaCache struct {
++	sync.Mutex
++	path   string
++	readAt time.Time
++	value  quotaSnapshot
++}
++
++func defaultUsageFile() string {
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return ""
++	}
++	return filepath.Join(home, ".local", "share", "cliproxy-hub", "routing-usage.json")
++}
++
++func readQuotaSnapshot(path string, now time.Time) quotaSnapshot {
++	quotaCache.Lock()
++	defer quotaCache.Unlock()
++	if quotaCache.path == path && now.Sub(quotaCache.readAt) >= 0 && now.Sub(quotaCache.readAt) < time.Second {
++		return quotaCache.value
++	}
++	value := quotaCache.value
++	if quotaCache.path != path {
++		value = quotaSnapshot{}
++	}
++	if file, err := os.Open(path); err == nil {
++		defer file.Close()
++		// Quotas are hints only. A missing, oversized or malformed snapshot
++		// must never bypass permissions or turn a provider outage into lockout.
++		if raw, err := io.ReadAll(io.LimitReader(file, 1024*1024+1)); err == nil && len(raw) <= 1024*1024 {
++			var next quotaSnapshot
++			if json.Unmarshal(raw, &next) == nil && next.Version == 1 && len(next.Accounts) <= 1000 {
++				value = next
++			}
++		}
++	}
++	quotaCache.path, quotaCache.readAt, quotaCache.value = path, now, value
++	return value
++}
++
++// Scores are admission hints, not a token-capacity estimate. The tightest
++// relevant quota controls the weight; reset urgency contributes at most 25%.
++func quotaScore(candidate pluginapi.SchedulerAuthCandidate, model string, snapshot quotaSnapshot, now time.Time) (float64, bool, float64) {
++	headroom, known := quotaHeadroom(candidate, model, snapshot, now)
++	if !known {
++		return 0, false, headroom
++	}
++	weight := math.Inf(1)
++	quota := snapshot.Accounts[candidate.ID]
++	for _, window := range quota.Windows {
++		if !validQuotaWindow(window, candidate.Provider, model, quota.CheckedAt, now) {
++			continue
++		}
++		r := math.Max(0, (*window.Remaining/100-0.03)/0.97)
++		urgency := 0.0
++		if window.ResetsAt != nil {
++			horizon := 30 * time.Minute
++			if window.DurationSeconds >= 604800 || window.Label == "1w" || window.Label == "Opus" || window.Label == "Sonnet" || window.Label == "Fable" {
++				horizon = 6 * time.Hour
++			}
++			if window.DurationSeconds >= 2419200 || window.Label == "1mo" {
++				horizon = 24 * time.Hour
++			}
++			urgency = math.Max(0, math.Min(1, 1-window.ResetsAt.Sub(now).Seconds()/horizon.Seconds()))
++		}
++		weight = math.Min(weight, math.Pow(r, 1.5)*(1+0.25*urgency))
++	}
++	return math.Max(0.0025, weight) * bankedResetMultiplier(candidate.Provider, quota.ResetCredits, now), true, headroom
++}
++
++// Banked resets favor new sessions on accounts whose credits will expire soon.
++// They are not usable quota: zero exclusion and the admission reserve still
++// apply, and selection never redeems a credit or moves a healthy binding.
++func bankedResetMultiplier(provider string, credits *resetCredits, now time.Time) float64 {
++	if provider != "codex" || credits == nil || credits.AvailableCount <= 0 || credits.AvailableCount > 1000 ||
++		credits.CheckedAt.IsZero() || now.Sub(credits.CheckedAt) > 15*time.Minute || credits.CheckedAt.After(now.Add(5*time.Second)) ||
++		len(credits.Expirations) > 1000 {
++		return 1
++	}
++	expirations := append([]time.Time(nil), credits.Expirations...)
++	sort.Slice(expirations, func(i, j int) bool { return expirations[i].Before(expirations[j]) })
++	urgency, available := 0.0, credits.AvailableCount
++	for _, expiration := range expirations {
++		if !expiration.After(now) {
++			continue
++		}
++		if available == 0 {
++			break
++		}
++		available--
++		urgency += math.Max(0, 1-expiration.Sub(now).Hours()/(7*24))
++	}
++	return 1 + math.Min(3, 2*urgency)
++}
++
++func validQuotaWindow(window quotaWindow, provider, model string, checkedAt, now time.Time) bool {
++	relevant := relevantWindow(window.Label, provider, model)
++	if window.Scope != "" {
++		relevant = false
++		if window.Scope == "general" {
++			relevant = true
++		}
++		if provider == "claude" && window.Scope == claudeModelFamily(model) {
++			relevant = true
++		}
++	}
++	return relevant && window.Remaining != nil &&
++		!math.IsNaN(*window.Remaining) && !math.IsInf(*window.Remaining, 0) && *window.Remaining >= 0 && *window.Remaining <= 100 &&
++		!(window.ResetsAt != nil && !window.ResetsAt.After(now) && checkedAt.Before(*window.ResetsAt))
++}
++
++// Exponential races implement weighted random sampling with a stable hash.
++// Candidate order and process restarts do not change the random draw. Bindings
++// still pin the result when quota weights change during a conversation.
++func weightedAccount(candidates []pluginapi.SchedulerAuthCandidate, model, namespace string, snapshot quotaSnapshot, now time.Time) string {
++	weights := make([]float64, len(candidates))
++	known := make([]bool, len(candidates))
++	headrooms := make([]float64, len(candidates))
++	healthy, totalKnown, unknown := false, 0.0, 0
++	for i, candidate := range candidates {
++		weights[i], known[i], headrooms[i] = quotaScore(candidate, model, snapshot, now)
++		if known[i] && headrooms[i] > 3 {
++			healthy = true
++		}
++	}
++	for i := range candidates {
++		if known[i] {
++			if healthy && headrooms[i] <= 3 {
++				weights[i] = 0
++			}
++			totalKnown += weights[i]
++		} else {
++			unknown++
++		}
++	}
++	choice, best := "", math.Inf(1)
++	for i, candidate := range candidates {
++		weight := weights[i]
++		if !known[i] {
++			weight = 1
++			// Unknown accounts together get at most 20% of new starts when
++			// fresh healthy alternatives exist; feed outages never lock out.
++			if healthy {
++				weight = totalKnown * 0.25 / float64(unknown)
++			}
++		}
++		if weight <= 0 {
++			continue
++		}
++		digest := sha256.Sum256([]byte(namespace + "\x00" + candidate.ID))
++		u := (float64(binary.BigEndian.Uint64(digest[:8])>>12) + 1) / (float64(uint64(1)<<52) + 1)
++		race := -math.Log(u) / weight
++		if race < best || (race == best && candidate.ID < choice) {
++			choice, best = candidate.ID, race
++		}
++	}
++	return choice
++}
++
++func relevantWindow(label, provider, model string) bool {
++	switch label {
++	case "5h", "1w", "1mo":
++		return true
++	case "Opus", "Sonnet", "Fable":
++		return provider == "claude" && claudeModelFamily(model) == strings.ToLower(label)
++	default:
++		return false
++	}
++}
++
++// Keep legacy aliases explicit: this identifier is registered by the host.
++// Unknown model names use general windows without guessing a scoped family.
++func claudeModelFamily(model string) string {
++	model = canonicalModel(model)
++	if model == "claude-3-7-sonnet-20250219" {
++		return "sonnet"
++	}
++	for _, family := range []string{"opus", "sonnet", "fable"} {
++		if model == "claude-"+family || strings.HasPrefix(model, "claude-"+family+"-") {
++			return family
++		}
++	}
++	return ""
++}
++
++// quotaHeadroom returns the smallest applicable percentage. Every applicable
++// window constrains a request: a full weekly bucket cannot override an empty
++// five-hour bucket, and an empty Sonnet bucket does not block Opus.
++func quotaHeadroom(candidate pluginapi.SchedulerAuthCandidate, model string, snapshot quotaSnapshot, now time.Time) (float64, bool) {
++	quota, ok := snapshot.Accounts[candidate.ID]
++	if !ok || quota.Provider != candidate.Provider || quota.CheckedAt.IsZero() ||
++		now.Sub(quota.CheckedAt) > quotaMaxAge || quota.CheckedAt.After(now.Add(5*time.Second)) {
++		return 0, false
++	}
++	remaining, known := 100.0, false
++	for _, window := range quota.Windows {
++		if !validQuotaWindow(window, candidate.Provider, model, quota.CheckedAt, now) {
++			continue
++		}
++		// A reset crossing invalidates the old observation. Do not invent a
++		// replenished quota; the provider or the next refresh confirms it.
++		known = true
++		remaining = math.Min(remaining, *window.Remaining)
++	}
++	return remaining, known
++}
+diff --git a/quota_test.go b/quota_test.go
+new file mode 100644
+index 0000000..3da9331
+--- /dev/null
++++ b/quota_test.go
+@@ -0,0 +1,396 @@
++package main
++
++import (
++	"encoding/json"
++	"fmt"
++	"math"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++)
++
++func quotaFixture(t *testing.T, now time.Time, windows string) quotaSnapshot {
++	t.Helper()
++	var value quotaSnapshot
++	raw := `{"version":1,"accounts":{"work":{"provider":"claude","checkedAt":"` + now.Format(time.RFC3339Nano) + `","windows":` + windows + `}}}`
++	if err := json.Unmarshal([]byte(raw), &value); err != nil {
++		t.Fatal(err)
++	}
++	return value
++}
++
++func TestQuotaBottlenecksAndModelScopes(t *testing.T) {
++	now := time.Now()
++	candidate := pluginapi.SchedulerAuthCandidate{ID: "work", Provider: "claude"}
++	for _, tc := range []struct {
++		name, model, windows string
++		want                 float64
++		known                bool
++	}{
++		{"short bucket empty", "claude-opus-5", `[{"label":"5h","remaining":0},{"label":"1w","remaining":90}]`, 0, true},
++		{"weekly bottleneck", "claude-opus-5", `[{"label":"5h","remaining":90},{"label":"1w","remaining":4}]`, 4, true},
++		{"unrelated model", "claude-opus-5", `[{"label":"Sonnet","remaining":0},{"label":"Cowork","remaining":0},{"label":"1w","remaining":80}]`, 80, true},
++		{"scoped exhaustion", "claude-sonnet-5-5", `[{"label":"Sonnet","remaining":0},{"label":"1w","remaining":80}]`, 0, true},
++		{"legacy scoped exhaustion", "claude-3-7-sonnet-20250219", `[{"label":"Sonnet","remaining":0},{"label":"1w","remaining":80}]`, 0, true},
++		{"legacy explicit scope", "claude-3-7-sonnet-20250219", `[{"scope":"sonnet","remaining":0},{"scope":"general","remaining":80}]`, 0, true},
++		{"unknown family", "claude-unknown", `[{"scope":"sonnet","remaining":0},{"scope":"general","remaining":80}]`, 80, true},
++		{"missing percent", "claude-opus-5", `[{"label":"5h"}]`, 100, false},
++		{"invalid percent", "claude-opus-5", `[{"label":"5h","remaining":101}]`, 100, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, known := quotaHeadroom(candidate, tc.model, quotaFixture(t, now, tc.windows), now)
++			if got != tc.want || known != tc.known {
++				t.Fatalf("got (%v,%v), want (%v,%v)", got, known, tc.want, tc.known)
++			}
++		})
++	}
++}
++
++func TestLegacySonnetScopedExhaustionRoutesToHealthyAccount(t *testing.T) {
++	for _, window := range []quotaWindow{{Label: "Sonnet"}, {Scope: "sonnet"}} {
++		t.Run(window.Label+window.Scope, func(t *testing.T) {
++			file := filepath.Join(t.TempDir(), "routing-usage.json")
++			raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("usage-file: " + file + "\nusers:\n  - {name: legacy-sonnet, api-keys: [k], primary: [id=depleted, id=healthy]}\n")})
++			if err := configure(raw); err != nil {
++				t.Fatal(err)
++			}
++			zero, remaining := 0.0, 80.0
++			window.Remaining = &zero
++			snapshot := quotaSnapshot{Version: 1, Accounts: map[string]accountQuota{
++				"depleted": {Provider: "claude", CheckedAt: time.Now(), Windows: []quotaWindow{{Scope: "general", Remaining: &remaining}, window}},
++				"healthy":  {Provider: "claude", CheckedAt: time.Now(), Windows: []quotaWindow{{Scope: "general", Remaining: &remaining}}},
++			}}
++			encoded, _ := json.Marshal(snapshot)
++			if err := os.WriteFile(file, encoded, 0600); err != nil {
++				t.Fatal(err)
++			}
++			depleted := pluginapi.SchedulerAuthCandidate{ID: "depleted", Provider: "claude"}
++			healthy := pluginapi.SchedulerAuthCandidate{ID: "healthy", Provider: "claude"}
++			for _, model := range []string{"claude-3-7-sonnet-20250219", "CLAUDE-3-7-SONNET-20250219(high)", "claude-sonnet-5-5"} {
++				if got := pickModel(t, model, scope("k"), depleted, healthy); got.AuthID != healthy.ID || got.Reject {
++					t.Fatalf("%s must avoid Sonnet exhaustion: %+v", model, got)
++				}
++			}
++			if got := pickModel(t, "claude-opus-5", scope("k"), depleted); got.AuthID != depleted.ID || got.Reject {
++				t.Fatalf("Sonnet exhaustion must not block Opus: %+v", got)
++			}
++		})
++	}
++}
++
++func TestExplicitFallbackHeaderPrecedesGeneratedSessionMetadata(t *testing.T) {
++	for _, metadataKey := range []string{"execution_session_id", "derived_session_id"} {
++		t.Run(metadataKey, func(t *testing.T) {
++			now := time.Now()
++			candidates, snapshot := weightedFixture(now, map[string]float64{"a": 80, "b": 40})
++			user := &userConfig{Name: "explicit-header-test-" + metadataKey}
++			req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6-sol", Options: pluginapi.SchedulerOptions{
++				Headers:  map[string][]string{"X-Codex-Session-Id": {"stable-session"}},
++				Metadata: map[string]any{metadataKey: "initial-generated-session"},
++			}}
++			first, _ := bestForSession(user, req, candidates, nil, snapshot, now)
++			values := map[string]float64{"a": 99, "b": 99}
++			values[first] = 1 // New bindings must choose the other account.
++			_, changed := weightedFixture(now, values)
++			for i := 0; i < 100; i++ {
++				req.Options.Metadata[metadataKey] = fmt.Sprint(i)
++				if got, _ := bestForSession(user, req, candidates, nil, changed, now); got != first {
++					t.Fatal("stable explicit session header lost affinity to changing generated metadata")
++				}
++			}
++		})
++	}
++}
++
++func TestQuotaFreshnessAndResetCrossing(t *testing.T) {
++	now := time.Now()
++	candidate := pluginapi.SchedulerAuthCandidate{ID: "work", Provider: "claude"}
++	zero := `[{"label":"5h","remaining":0}]`
++	for _, checked := range []time.Time{now.Add(-quotaMaxAge - time.Second), now.Add(time.Minute)} {
++		if _, known := quotaHeadroom(candidate, "claude-opus-5", quotaFixture(t, checked, zero), now); known {
++			t.Fatal("stale or future data must not block an account")
++		}
++	}
++	reset := now.Add(-time.Second)
++	snapshot := quotaFixture(t, now.Add(-time.Minute), `[{"label":"5h","remaining":0,"resetsAt":"`+reset.Format(time.RFC3339Nano)+`"}]`)
++	if _, known := quotaHeadroom(candidate, "claude-opus-5", snapshot, now); known {
++		t.Fatal("a pre-reset observation must not masquerade as current quota")
++	}
++	snapshot = quotaFixture(t, now, `[{"label":"5h","remaining":0,"resetsAt":"`+reset.Format(time.RFC3339Nano)+`"}]`)
++	if remaining, known := quotaHeadroom(candidate, "claude-opus-5", snapshot, now); !known || remaining != 0 {
++		t.Fatal("fresh exhaustion after the nominal reset must still block")
++	}
++}
++
++func TestQuotaFileIsOptionalAndBounded(t *testing.T) {
++	now := time.Now()
++	file := filepath.Join(t.TempDir(), "routing-usage.json")
++	if value := readQuotaSnapshot(file, now); len(value.Accounts) != 0 {
++		t.Fatal("a missing snapshot must degrade to unknown quota")
++	}
++	for _, raw := range []string{`invalid`, `{"version":99,"accounts":{}}`, string(make([]byte, 1024*1024+1))} {
++		if err := os.WriteFile(file, []byte(raw), 0600); err != nil {
++			t.Fatal(err)
++		}
++		now = now.Add(2 * time.Second)
++		if value := readQuotaSnapshot(file, now); value.Version != 0 || len(value.Accounts) != 0 {
++			t.Fatal("invalid snapshots must not influence routing")
++		}
++	}
++}
++
++func TestExhaustedPinnedSessionMovesToPermittedAccount(t *testing.T) {
++	file := filepath.Join(t.TempDir(), "routing-usage.json")
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("usage-file: " + file + "\nusers:\n  - {name: zero-failover, api-keys: [k], primary: [id=work-a, id=work-b]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	a := pluginapi.SchedulerAuthCandidate{ID: "work-a", Provider: "codex"}
++	b := pluginapi.SchedulerAuthCandidate{ID: "work-b", Provider: "codex"}
++	other := pluginapi.SchedulerAuthCandidate{ID: "not-permitted", Provider: "codex"}
++	opts := scope("k")
++	opts.Headers = map[string][]string{"Session-Id": {"long-running-session"}}
++	write := func(aPercent, bPercent float64) {
++		t.Helper()
++		accounts := map[string]accountQuota{}
++		for id, percentage := range map[string]float64{a.ID: aPercent, b.ID: bPercent, other.ID: 100} {
++			remaining := percentage
++			accounts[id] = accountQuota{Provider: "codex", CheckedAt: time.Now(), Windows: []quotaWindow{{Label: "1w", Remaining: &remaining}},
++				ResetCredits: &resetCredits{CheckedAt: time.Now(), AvailableCount: 2, Expirations: []time.Time{time.Now().Add(time.Hour), time.Now().Add(2 * time.Hour)}}}
++		}
++		encoded, _ := json.Marshal(quotaSnapshot{Version: 1, Accounts: accounts})
++		if err := os.WriteFile(file, encoded, 0600); err != nil {
++			t.Fatal(err)
++		}
++		quotaCache.Lock()
++		quotaCache.readAt = time.Time{}
++		quotaCache.Unlock()
++	}
++	write(80, 0)
++	if got := pick(t, opts, other, a, b); got.AuthID != a.ID {
++		t.Fatalf("initial session must use account with quota: %+v", got)
++	}
++	write(0, 60)
++	if got := pick(t, opts, other, a, b); got.AuthID != b.ID || got.Reject {
++		t.Fatalf("exhausted pinned account must switch without rejecting the request: %+v", got)
++	}
++	write(90, 60)
++	if got := pick(t, opts, other, a, b); got.AuthID != b.ID {
++		t.Fatalf("recovering original account must not move the newly warm session: %+v", got)
++	}
++	write(0, 0)
++	if got := pick(t, opts, other, a, b); !got.Reject {
++		t.Fatalf("an empty permitted pool must never escape into another member's account: %+v", got)
++	}
++}
++
++func TestBankedResetExpirationMultiplier(t *testing.T) {
++	now := time.Now()
++	soon, later := now.Add(24*time.Hour), now.Add(14*24*time.Hour)
++	for _, tc := range []struct {
++		name, provider string
++		credits        *resetCredits
++		want           float64
++	}{
++		{"missing", "codex", nil, 1},
++		{"one expiring", "codex", &resetCredits{CheckedAt: now, AvailableCount: 1, Expirations: []time.Time{soon}}, 1 + 2*(1-1.0/7)},
++		{"many expiring capped", "codex", &resetCredits{CheckedAt: now, AvailableCount: 3, Expirations: []time.Time{soon, soon, soon}}, 4},
++		{"only earliest available count", "codex", &resetCredits{CheckedAt: now, AvailableCount: 1, Expirations: []time.Time{later, soon, soon}}, 1 + 2*(1-1.0/7)},
++		{"far expiration", "codex", &resetCredits{CheckedAt: now, AvailableCount: 1, Expirations: []time.Time{later}}, 1},
++		{"expired", "codex", &resetCredits{CheckedAt: now, AvailableCount: 2, Expirations: []time.Time{now.Add(-time.Hour), now}}, 1},
++		{"used", "codex", &resetCredits{CheckedAt: now, AvailableCount: 0, Expirations: []time.Time{soon}}, 1},
++		{"invalid count", "codex", &resetCredits{CheckedAt: now, AvailableCount: 1001, Expirations: []time.Time{soon}}, 1},
++		{"stale", "codex", &resetCredits{CheckedAt: now.Add(-15*time.Minute - time.Second), AvailableCount: 1, Expirations: []time.Time{soon}}, 1},
++		{"future observation", "codex", &resetCredits{CheckedAt: now.Add(time.Minute), AvailableCount: 1, Expirations: []time.Time{soon}}, 1},
++		{"unknown observation", "codex", &resetCredits{AvailableCount: 1, Expirations: []time.Time{soon}}, 1},
++		{"other provider", "claude", &resetCredits{CheckedAt: now, AvailableCount: 1, Expirations: []time.Time{soon}}, 1},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := bankedResetMultiplier(tc.provider, tc.credits, now); math.Abs(got-tc.want) > 1e-10 {
++				t.Fatalf("multiplier=%v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestExpiringBankedResetsFavorNewSessionsWithoutMovingBindings(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := weightedFixture(now, map[string]float64{"expiring": 80, "ordinary": 80})
++	quota := snapshot.Accounts["expiring"]
++	quota.ResetCredits = &resetCredits{CheckedAt: now, AvailableCount: 1, Expirations: []time.Time{now.Add(24 * time.Hour)}}
++	snapshot.Accounts["expiring"] = quota
++	const n = 20000
++	expiring := 0
++	for i := 0; i < n; i++ {
++		if got := weightedAccount(candidates, "gpt-6-sol", fmt.Sprintf("credit-%d", i), snapshot, now); got == "expiring" {
++			expiring++
++		}
++	}
++	share := float64(expiring) / n
++	if share < 0.715 || share > 0.745 {
++		t.Fatalf("one credit expiring tomorrow should receive about 73%% of equal-headroom starts, got %.3f", share)
++	}
++	// Credit preference must not admit new sessions on the 3% reserve.
++	remaining := 3.0
++	quota.Windows[0].Remaining = &remaining
++	snapshot.Accounts["expiring"] = quota
++	for i := 0; i < 100; i++ {
++		if got := weightedAccount(candidates, "gpt-6-sol", fmt.Sprintf("reserve-%d", i), snapshot, now); got != "ordinary" {
++			t.Fatal("banked resets overrode the admission reserve")
++		}
++	}
++
++	candidates, initial := weightedFixture(now, map[string]float64{"expiring": 80, "ordinary": 80})
++	user := &userConfig{Name: "credit-affinity-test"}
++	req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6-sol", Options: pluginapi.SchedulerOptions{
++		Metadata: map[string]any{"canonical_session_id": "banked-reset-session"},
++	}}
++	first, _ := bestForSession(user, req, candidates, nil, initial, now)
++	for id, quota := range initial.Accounts {
++		if id != first {
++			quota.ResetCredits = &resetCredits{CheckedAt: now, AvailableCount: 3, Expirations: []time.Time{now.Add(time.Hour), now.Add(time.Hour), now.Add(time.Hour)}}
++			initial.Accounts[id] = quota
++		}
++	}
++	for i := 0; i < 100; i++ {
++		if got, _ := bestForSession(user, req, candidates, nil, initial, now); got != first {
++			t.Fatal("expiring credits moved an established healthy binding")
++		}
++	}
++}
++
++func weightedFixture(now time.Time, values map[string]float64) ([]pluginapi.SchedulerAuthCandidate, quotaSnapshot) {
++	snapshot := quotaSnapshot{Version: 1, Accounts: map[string]accountQuota{}}
++	candidates := []pluginapi.SchedulerAuthCandidate{}
++	for id, remaining := range values {
++		r := remaining
++		candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: id, Provider: "codex"})
++		snapshot.Accounts[id] = accountQuota{Provider: "codex", CheckedAt: now, Windows: []quotaWindow{{Label: "1w", Remaining: &r}}}
++	}
++	return candidates, snapshot
++}
++
++func TestWeightedAdmissionDistributionAndOrderIndependence(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := weightedFixture(now, map[string]float64{"full": 80, "half": 40})
++	full := 0
++	const n = 20000
++	for i := 0; i < n; i++ {
++		namespace := fmt.Sprintf("simulation-%d", i)
++		choice := weightedAccount(candidates, "gpt-6-sol", namespace, snapshot, now)
++		if choice == "full" {
++			full++
++		}
++		if i < 100 {
++			reversed := []pluginapi.SchedulerAuthCandidate{candidates[1], candidates[0]}
++			if got := weightedAccount(reversed, "gpt-6-sol", namespace, snapshot, now); got != choice {
++				t.Fatal("candidate order changed weighted selection")
++			}
++		}
++	}
++	share := float64(full) / n
++	if share < 0.735 || share > 0.765 {
++		t.Fatalf("80/40 headroom should give about 75%% of new sessions to the fuller account, got %.3f", share)
++	}
++	lowCandidates, lowSnapshot := weightedFixture(now, map[string]float64{"healthy": 80, "reserved": 3})
++	for i := 0; i < 100; i++ {
++		if got := weightedAccount(lowCandidates, "gpt-6-sol", fmt.Sprint(i), lowSnapshot, now); got != "healthy" {
++			t.Fatal("new sessions must leave a near-empty account for existing sessions")
++		}
++	}
++}
++
++func TestUnknownQuotaIsBoundedWithoutLockout(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := weightedFixture(now, map[string]float64{"known": 80})
++	for _, id := range []string{"unknown-a", "unknown-b", "unknown-c"} {
++		candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: id, Provider: "codex"})
++	}
++	unknown := 0
++	for i := 0; i < 10000; i++ {
++		if weightedAccount(candidates, "gpt-6-sol", fmt.Sprint(i), snapshot, now) != "known" {
++			unknown++
++		}
++	}
++	if unknown < 1800 || unknown > 2200 {
++		t.Fatalf("combined unknown preference should be about 20%%, got %.2f%%", float64(unknown)/100)
++	}
++	for _, value := range []quotaSnapshot{{}, {Version: 1, Accounts: map[string]accountQuota{}}} {
++		if got := weightedAccount(candidates, "gpt-6-sol", "outage", value, now); got == "" {
++			t.Fatal("telemetry outage must not lock out eligible accounts")
++		}
++	}
++}
++
++func TestResetUrgencyCannotOverrideWeeklyBottleneck(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := weightedFixture(now, map[string]float64{"work": 4})
++	base, _, _ := quotaScore(candidates[0], "gpt-6-sol", snapshot, now)
++	soon := now.Add(time.Minute)
++	remaining := 95.0
++	quota := snapshot.Accounts["work"]
++	quota.Windows = append(quota.Windows, quotaWindow{Label: "5h", Remaining: &remaining, ResetsAt: &soon})
++	snapshot.Accounts["work"] = quota
++	if got, _, _ := quotaScore(candidates[0], "gpt-6-sol", snapshot, now); got != base {
++		t.Fatal("imminent short reset overrode the depleted weekly bottleneck")
++	}
++	quota.Windows = []quotaWindow{{Label: "1w", Remaining: &remaining}}
++	snapshot.Accounts["work"] = quota
++	base, _, _ = quotaScore(candidates[0], "gpt-6-sol", snapshot, now)
++	quota.Windows[0].ResetsAt = &soon
++	snapshot.Accounts["work"] = quota
++	boosted, _, _ := quotaScore(candidates[0], "gpt-6-sol", snapshot, now)
++	if boosted <= base || boosted > base*1.25 {
++		t.Fatal("reset urgency must supply a bounded positive boost")
++	}
++}
++
++func TestCanonicalAndAnonymousBindingsStayWarmAsQuotasChange(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := weightedFixture(now, map[string]float64{"a": 80, "b": 40})
++	user := &userConfig{Name: "canonical-affinity-test"}
++	opts := pluginapi.SchedulerOptions{Metadata: map[string]any{"canonical_session_id": "canonical"}, Headers: map[string][]string{"Session-Id": {"header-one"}}}
++	req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6-sol", Options: opts}
++	first, _ := bestForSession(user, req, candidates, nil, snapshot, now)
++	_, changed := weightedFixture(now, map[string]float64{"a": 1, "b": 99})
++	for i := 0; i < 1000; i++ {
++		req.Options.Headers["Session-Id"] = []string{fmt.Sprint(i)}
++		if got, _ := bestForSession(user, req, candidates, nil, changed, now); got != first {
++			t.Fatal("canonical session moved after quota or header changes")
++		}
++	}
++	req.Options = pluginapi.SchedulerOptions{}
++	anonymous, _ := bestForSession(user, req, candidates, nil, snapshot, now)
++	for i := 0; i < 100; i++ {
++		if got, _ := bestForSession(user, req, candidates, nil, changed, now); got != anonymous {
++			t.Fatal("anonymous tool calls must share a sticky binding")
++		}
++	}
++	// Racing first requests must publish one binding under the same lock.
++	req.Options.Metadata = map[string]any{"canonical_session_id": "concurrent-first"}
++	var wg sync.WaitGroup
++	results := make(chan string, 32)
++	for i := 0; i < 32; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			got, _ := bestForSession(user, req, candidates, nil, snapshot, now)
++			results <- got
++		}()
++	}
++	wg.Wait()
++	close(results)
++	first = ""
++	for got := range results {
++		if first == "" {
++			first = got
++		}
++		if got != first {
++			t.Fatal("concurrent first requests split session affinity")
++		}
++	}
++}
