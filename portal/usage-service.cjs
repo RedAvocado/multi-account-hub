@@ -9,6 +9,15 @@ const {createResetCredits, ResetError, CREDIT_URL, sanitizeCredits} = require('.
 const MAX_AGE = 30 * 1000;
 const RETRY_DELAY = 60 * 1000;
 const CREDIT_MAX_AGE = 5 * 60 * 1000;
+const CLAUDE_PROFILE_MAX_AGE = 15 * 60 * 1000;
+const SHARED_DIRECTORY = '.claude-usage-cache';
+const LOCK_SUFFIX = '.lock';
+const LOCK_WAIT = 2000;
+const LOCK_STALE = 60000;
+const SHARED_SUCCESS_INTERVAL = 60 * 1000;
+const CLAUDE_MAX_AGE = 90 * 1000;
+const COOLDOWN_FLOOR = 60 * 1000;
+const COOLDOWN_MAX = 15 * 60 * 1000;
 
 // The management API is local only. Neither its credential nor the upstream
 // response is returned to a browser; callers receive sanitized usage fields.
@@ -95,16 +104,114 @@ function parseClaude(body, {precise = false} = {}) {
   return {plan: null, windows, bankedResets: null, resetExpirations: [], renewsAt: null};
 }
 
+function claudePlan(profile) {
+  const organization = profile?.organization;
+  const type = organization?.organization_type;
+  if (type === 'claude_enterprise') return 'Enterprise';
+  if (type === 'claude_team') {
+    const seat = organization.seat_tier === 'team_standard' ? 'Standard' : organization.seat_tier === 'team_premium' ? 'Premium' : null;
+    return seat ? `Team — ${seat}` : 'Team';
+  }
+  if (profile?.account?.has_claude_max === true || type === 'claude_max') {
+    const tier = organization?.rate_limit_tier;
+    const multiplier = tier === 'default_claude_max_5x' ? '5×' : tier === 'default_claude_max_20x' ? '20×' : null;
+    return multiplier ? `Max ${multiplier}` : 'Max';
+  }
+  return profile?.account?.has_claude_pro === true || type === 'claude_pro' ? 'Pro' : null;
+}
+
 const accountId = account => crypto.createHash('sha256').update(JSON.stringify([account.id, account.provider, account.email])).digest('hex');
 
 function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now, details = true, routingCredits = false, history}) {
   const cache = new Map();
   const creditCache = new Map();
+  const claudeProfiles = new Map();
   const pending = new Map();
   const generations = new Map();
   const usageKey = account => JSON.stringify([account.id, account.provider, account.email, account.personal]);
+  const newestObservation = (...records) => records.filter(record => record?.value && Number.isFinite(record.checkedAt))
+    .sort((left, right) => right.checkedAt - left.checkedAt)[0];
+  // Keep telemetry outside the auth directory's watched JSON files: replacing
+  // a quota observation must never look like a provider credential change.
+  const sharedPath = authDir && path.join(authDir, SHARED_DIRECTORY);
+  const sharedFile = key => sharedPath && path.join(sharedPath, `${crypto.createHash('sha256').update(key).digest('hex')}.json`);
+  const sharedLock = key => sharedFile(key) && `${sharedFile(key)}${LOCK_SUFFIX}`;
+  const isClaudeKey = key => {
+    try { return JSON.parse(key)?.[1] === 'claude'; } catch (_) { return false; }
+  };
+  function readShared(key) {
+    if (!key || !isClaudeKey(key) || !sharedFile(key)) return null;
+    try {
+      const value = JSON.parse(fs.readFileSync(sharedFile(key), 'utf8'));
+      const record = value?.version === 2 && value.record;
+      const validTime = time => Number.isFinite(time) && time >= 0;
+      if (!record || record.__usageKey !== key || typeof record.failed !== 'boolean' ||
+          !validTime(record.attemptedAt) || !validTime(record.nextAttemptAt) ||
+          (record.checkedAt !== null && !validTime(record.checkedAt)) ||
+          (!record.failed && !Array.isArray(record.value?.windows)) ||
+          (record.value && !Array.isArray(record.value.windows))) return null;
+      return record;
+    }
+    catch (_) { return null; }
+  }
+  function writeShared(key, record) {
+    if (!sharedPath || !isClaudeKey(key)) return false;
+    let temporary;
+    try {
+      const file = sharedFile(key);
+      temporary = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify({version: 2, record: {...record, __usageKey: key}}), {mode: 0o600, flag: 'wx'});
+      fs.renameSync(temporary, file);
+      try { fs.chmodSync(file, 0o600); } catch (_) { return false; }
+      return true;
+    } catch (_) {
+      if (temporary) { try { fs.unlinkSync(temporary); } catch (_) {} }
+      return false;
+    }
+  }
+  async function acquireShared(key) {
+    const lock = sharedLock(key); if (!lock) return null;
+    try { fs.mkdirSync(sharedPath, {recursive: true, mode: 0o700}); }
+    catch (_) { return null; }
+    const started = Date.now();
+    while (Date.now() - started < LOCK_WAIT) {
+      let handle;
+      const token = crypto.randomBytes(16).toString('hex');
+      try {
+        handle = await fs.promises.open(lock, 'wx', 0o600);
+        await handle.writeFile(JSON.stringify({version: 1, token, pid: process.pid, createdAt: Date.now()}));
+        return async () => {
+          try {
+            const current = JSON.parse(await fs.promises.readFile(lock, 'utf8'));
+            if (current?.token === token) await fs.promises.unlink(lock);
+          } catch (_) {}
+          try { await handle.close(); } catch (_) {}
+        };
+      } catch (error) {
+        if (handle) {
+          try { await handle.close(); } catch (_) {}
+          try { await fs.promises.unlink(lock); } catch (_) {}
+        }
+        // Keep quota failures private; the caller receives stale state only.
+        if (error.code !== 'EEXIST') return null;
+        try {
+          const stat = await fs.promises.stat(lock);
+          if (Date.now() - stat.mtimeMs > LOCK_STALE) {
+            const current = JSON.parse(await fs.promises.readFile(lock, 'utf8'));
+            const check = await fs.promises.stat(lock);
+            if (check.ino === stat.ino && check.mtimeMs === stat.mtimeMs && current?.token) await fs.promises.unlink(lock);
+          }
+        } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+    return null;
+  }
   const resetCredits = createResetCredits({resolve: resolveCodexAccount, management, now, invalidate(account) {
     const key = usageKey(account);
+    // Reset redemption invalidates this process's Codex observations. Shared
+    // quota state is Claude-only, so deleting a file cannot cancel another
+    // process's in-flight Codex read or make its local generation advance.
     cache.delete(key); creditCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
   }});
   let running = 0;
@@ -126,7 +233,22 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
   }
   async function upstream(index, url, header) {
     const result = await management('api-call', {auth_index: index, method: 'GET', url, header});
-    if (!Number.isInteger(result.status_code) || result.status_code < 200 || result.status_code >= 300 || typeof result.body !== 'string' || result.body.length > 500000) throw new Error('provider unavailable');
+    if (!Number.isInteger(result.status_code) || result.status_code < 200 || result.status_code >= 300) {
+      const error = new Error('provider unavailable');
+      const headers = result?.header && typeof result.header === 'object' ? result.header : {};
+      const headerName = Object.keys(headers).find(name => name.toLowerCase() === 'retry-after');
+      const raw = headerName ? headers[headerName] : undefined;
+      const value = Array.isArray(raw) ? raw[0] : raw;
+      const seconds = Number(value);
+      const dateDelay = typeof value === 'string' && !Number.isFinite(seconds) ? Date.parse(value) - now() : NaN;
+      const delay = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : dateDelay;
+      error.rateLimited = result.status_code === 429;
+      error.retryAfterMs = error.rateLimited
+        ? Math.max(COOLDOWN_FLOOR, Number.isFinite(delay) && delay > 0 ? Math.min(delay, COOLDOWN_MAX) : COOLDOWN_FLOOR)
+        : COOLDOWN_FLOOR;
+      throw error;
+    }
+    if (typeof result.body !== 'string' || result.body.length > 500000) throw new Error('provider unavailable');
     return JSON.parse(result.body);
   }
   function accountContext(account, files) {
@@ -186,9 +308,58 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       return consistent(value) ? value : null; // Retain successful age without reusing uncertain expirations.
     }
   }
+  async function fetchClaudeQuota(account, files) {
+    const key = usageKey(account);
+    const latest = readShared(key);
+    const current = now();
+    if (latest && latest.nextAttemptAt > current) return latest;
+    const release = await acquireShared(key);
+    if (!release) {
+      // A shared lock or state file failure must fail closed. Returning stale
+      // local data is safe; starting an unlocked provider read is not.
+      return {value: latest?.value || null, checkedAt: latest?.checkedAt || null, attemptedAt: current,
+        nextAttemptAt: Math.max(latest?.nextAttemptAt || 0, current + COOLDOWN_FLOOR), failed: true,
+        failureCount: (latest?.failureCount || 0) + 1};
+    }
+    let locked = null;
+    try {
+      locked = readShared(key);
+      const at = now();
+      if (locked && locked.nextAttemptAt > at) return locked;
+      const {index, header} = accountContext(account, files);
+      header['User-Agent'] = 'claude-cli/2.1.280 (external, cli)';
+      header['anthropic-beta'] = 'oauth-2025-04-20';
+      const body = await upstream(index, 'https://api.anthropic.com/api/oauth/usage', header);
+      const value = parseClaude(body, {precise: true});
+      if (!value.windows.length) throw new Error('no usage data');
+      const attemptedAt = now();
+      const nextReset = Math.min(...value.windows.map(window => Date.parse(window.resetsAt))
+        .filter(reset => Number.isFinite(reset) && reset > attemptedAt));
+      const record = {value, checkedAt: attemptedAt, attemptedAt,
+        nextAttemptAt: Math.min(attemptedAt + SHARED_SUCCESS_INTERVAL, nextReset), failed: false, failureCount: 0};
+      // A successful upstream read is useful only if every process can see it.
+      if (!writeShared(key, record)) {
+        return {value: locked?.value || null, checkedAt: locked?.checkedAt || null,
+          attemptedAt, nextAttemptAt: attemptedAt + COOLDOWN_FLOOR, failed: true,
+          failureCount: (locked?.failureCount || 0) + 1};
+      }
+      return record;
+    } catch (error) {
+      const attemptedAt = now();
+      const previous = readShared(key) || locked || null;
+      const failureCount = previous?.failed ? Math.min((previous.failureCount || 1) + 1, 20) : 1;
+      const exponential = Math.min(COOLDOWN_MAX, COOLDOWN_FLOOR * 2 ** Math.min(failureCount - 1, 4));
+      const delay = error?.rateLimited ? Math.max(exponential, error.retryAfterMs || COOLDOWN_FLOOR) : COOLDOWN_FLOOR;
+      const record = {value: previous?.value || null, checkedAt: previous?.checkedAt || null, attemptedAt,
+        nextAttemptAt: attemptedAt + Math.min(delay, COOLDOWN_MAX), failed: true, failureCount,
+        rateLimited: error?.rateLimited === true};
+      writeShared(key, record);
+      return record;
+    } finally { await release(); }
+  }
   async function fetchAccount(account, files) {
-    const {index, header} = accountContext(account, files);
     if (account.provider === 'codex') {
+      const {index, header} = accountContext(account, files);
       const body = await upstream(index, 'https://chatgpt.com/backend-api/wham/usage', header);
       const checkedAt = now();
       const result = parseCodex(body, {precise: true});
@@ -214,19 +385,28 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       return {value: result, checkedAt};
     }
     if (account.provider === 'claude') {
-      header['User-Agent'] = 'claude-cli/2.1.280 (external, cli)';
-      header['anthropic-beta'] = 'oauth-2025-04-20';
-      const body = await upstream(index, 'https://api.anthropic.com/api/oauth/usage', header);
-      const checkedAt = now();
-      const result = parseClaude(body, {precise: true});
-      if (!result.windows.length) throw new Error('no usage data');
+      const quota = await fetchClaudeQuota(account, files);
+      if (quota.failed || !quota.value) throw Object.assign(new Error('provider unavailable'), {quota});
+      const result = {...quota.value};
+      const checkedAt = quota.checkedAt;
       if (!details) return {value: result, checkedAt};
+      const profileKey = usageKey(account), previousProfile = claudeProfiles.get(profileKey);
+      if (previousProfile && now() - previousProfile.attemptedAt <
+          (previousProfile.failed ? RETRY_DELAY : CLAUDE_PROFILE_MAX_AGE)) {
+        result.plan = previousProfile.plan;
+        return {value: result, checkedAt};
+      }
+      const {header: profileHeader, index: profileIndex} = accountContext(account, files);
+      profileHeader['User-Agent'] = 'claude-cli/2.1.280 (external, cli)';
+      profileHeader['anthropic-beta'] = 'oauth-2025-04-20';
       try {
-        const profile = await upstream(index, 'https://api.anthropic.com/api/oauth/profile', header);
-        if (profile.account?.has_claude_max === true) result.plan = 'Max';
-        else if (profile.account?.has_claude_pro === true) result.plan = 'Pro';
-        else if (profile.organization?.organization_type === 'claude_team') result.plan = 'Team';
-      } catch (_) { /* Optional detail. */ }
+        const profile = await upstream(profileIndex, 'https://api.anthropic.com/api/oauth/profile', profileHeader);
+        result.plan = claudePlan(profile);
+        claudeProfiles.set(profileKey, {plan: result.plan, attemptedAt: now(), failed: false});
+      } catch (_) {
+        result.plan = previousProfile?.plan || null;
+        claudeProfiles.set(profileKey, {plan: result.plan, attemptedAt: now(), failed: true});
+      }
       return {value: result, checkedAt};
     }
     throw new Error('unsupported provider');
@@ -238,18 +418,49 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       if ((generations.get(cacheKey) || 0) !== generation) return {value: null, checkedAt: null, attemptedAt: now(), failed: true};
       cache.set(cacheKey, record); return record;
     };
+    const shared = readShared(cacheKey);
     const previous = cache.get(cacheKey);
     const minAge = refresh && !previous?.failed ? 30000 : previous?.failed ? RETRY_DELAY : MAX_AGE;
-    if (previous && now() - previous.attemptedAt < minAge) return previous;
+    const sharedNewer = account.provider === 'claude' && shared &&
+      (!previous || shared.attemptedAt > previous.attemptedAt);
+    if (sharedNewer && shared.failed && shared.nextAttemptAt > now()) {
+      const best = newestObservation(previous, shared);
+      return save({value: best?.value || null,
+        checkedAt: best?.checkedAt ?? null,
+        attemptedAt: shared.attemptedAt, failed: true, nextAttemptAt: shared.nextAttemptAt,
+        rateLimited: shared.rateLimited === true});
+    }
+    // A newer shared success must be allowed through to fetchAccount so a
+    // details-enabled process can refresh its own profile enrichment.
+    const claudeRefreshDue = account.provider === 'claude' && shared && !shared.failed && shared.nextAttemptAt <= now();
+    if (!sharedNewer && !claudeRefreshDue && previous && now() - previous.attemptedAt < minAge) return previous;
+    if (sharedNewer && !shared.failed && !details && shared.nextAttemptAt > now()) {
+      return save({value: shared.value, checkedAt: shared.checkedAt, attemptedAt: shared.attemptedAt,
+        failed: false, nextAttemptAt: shared.nextAttemptAt});
+    }
+    if (!previous && shared?.failed && shared.nextAttemptAt > now()) {
+      return save({value: shared.value || null, checkedAt: shared.checkedAt || null,
+        attemptedAt: shared.attemptedAt || now(), failed: true, nextAttemptAt: shared.nextAttemptAt,
+        rateLimited: shared.rateLimited === true});
+    }
+    if (previous?.failed && previous.nextAttemptAt > now()) return previous;
     if (pending.has(cacheKey)) return pending.get(cacheKey);
     const action = limited(async () => {
       try {
         const files = await filesPromise();
         const {value, checkedAt} = await fetchAccount(account, files);
-        const record = {value, checkedAt, attemptedAt: now(), failed: false};
+        const record = {value, checkedAt, attemptedAt: now(), failed: false, nextAttemptAt: now() + MAX_AGE};
         return save(record);
-      } catch (_) {
-        const record = {value: previous?.value || null, checkedAt: previous?.checkedAt || null, attemptedAt: now(), failed: true};
+      } catch (error) {
+        const attemptedAt = now();
+        const latest = account.provider === 'claude' ? readShared(cacheKey) : null;
+        const quota = error?.quota;
+        const best = newestObservation(previous, quota, latest);
+        const record = {value: best?.value || null,
+          checkedAt: best?.checkedAt ?? null, attemptedAt, failed: true,
+          rateLimited: (quota || latest)?.rateLimited === true,
+          nextAttemptAt: quota?.nextAttemptAt || latest?.nextAttemptAt || attemptedAt +
+            (account.provider === 'claude' && Number.isFinite(error?.retryAfterMs) ? error.retryAfterMs : RETRY_DELAY)};
         return save(record);
       }
     });
@@ -275,10 +486,18 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       const status = values[index];
       return [{id: accountId(account), provider: account.provider, email: account.email, organization: account.organization, displayName: account.displayName || '',
         ...(status.value || {plan: null, windows: [], bankedResets: null, resetExpirations: [], renewsAt: null}),
+        ...(account.provider === 'claude' && details ? {plan: claudeProfiles.get(usageKey(account))?.plan ?? status.value?.plan ?? null} : {}),
         windows: (status.value?.windows || []).map(({label,remaining,resetsAt}) => ({label,remaining: Math.round(remaining * 10) / 10,resetsAt})),
         ...(history ? {burnRates: history.get(account.id, account.provider)} : {}),
         checkedAt: status.checkedAt ? new Date(status.checkedAt).toISOString() : null,
-        stale: status.failed || (status.checkedAt !== null && now() - status.checkedAt >= MAX_AGE)}];
+        ...(account.provider === 'claude' && status.failed && status.rateLimited ? {rateLimited: true} : {}),
+        // Claude is polled once a minute across all processes. Allow a bounded
+        // scheduling margin without changing the original observation time.
+        // Crossing any observed reset always requires a new provider reading.
+        stale: status.failed || (status.checkedAt !== null && now() - status.checkedAt >=
+          (account.provider === 'claude' ? CLAUDE_MAX_AGE : MAX_AGE)) ||
+          (account.provider === 'claude' && (status.value?.windows || []).some(window =>
+            window.resetsAt && Date.parse(window.resetsAt) <= now()))}];
     })};
   }
   // Local scheduling data only. Account permissions are still enforced by the
@@ -312,4 +531,4 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
   return {getForUser, listForUser, resetCredits, getForRouting, invalidateAccount};
 }
 
-module.exports = {createUsage, parseCodex, parseClaude, managementClient};
+module.exports = {createUsage, parseCodex, parseClaude, claudePlan, managementClient};

@@ -29,6 +29,7 @@
 !/scripts/
 !/scripts/*.py
 !/scripts/*.cjs
+!/scripts/t3-claude-plan.md
 !/examples/
 !/examples/*.example.json
 !/examples/*.example.yaml

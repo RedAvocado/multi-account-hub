@@ -2,9 +2,26 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const {spawn} = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
-const {createUsage, parseCodex, parseClaude} = require('./usage-service.cjs');
+const {createUsage, parseCodex, parseClaude, claudePlan} = require('./usage-service.cjs');
+
+test('Claude plan names use confirmed multipliers and seat tiers without guessing unknown tiers', () => {
+  const max = {account: {has_claude_max: true}, organization: {rate_limit_tier: 'default_claude_max_20x'}};
+  assert.equal(claudePlan(max), 'Max 20×');
+  assert.equal(claudePlan({...max, organization: {rate_limit_tier: 'default_claude_max_5x'}}), 'Max 5×');
+  for (const tier of [undefined, 'unknown', 'constructor', '__proto__']) {
+    assert.equal(claudePlan({...max, organization: {rate_limit_tier: tier}}), 'Max');
+  }
+  assert.equal(claudePlan({organization: {organization_type: 'claude_team', seat_tier: 'team_standard'}}), 'Team — Standard');
+  assert.equal(claudePlan({account: {has_claude_max: true}, organization: {organization_type: 'claude_team', seat_tier: 'team_premium'}}), 'Team — Premium');
+  assert.equal(claudePlan({organization: {organization_type: 'claude_team', seat_tier: 'unknown'}}), 'Team');
+  assert.equal(claudePlan({organization: {organization_type: 'claude_enterprise'}}), 'Enterprise');
+  assert.equal(claudePlan({account: {has_claude_pro: true}}), 'Pro');
+  assert.equal(claudePlan({}), null);
+  assert.equal(claudePlan(null), null);
+});
 
 test('operator reset invalidation refreshes quota and credit details without affecting other accounts', async t => {
   const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-operator-invalidation-'));
@@ -125,6 +142,142 @@ test('usage respects exact account grants, hides personal information, caches re
     users[1].enabled = false;
     await assert.rejects(usage.getForUser(jordan));
   } finally { fs.rmSync(authDir, {recursive:true,force:true}); }
+});
+
+test('shared quota state coordinates processes and backs off provider rate limits', async t => {
+  const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-shared-usage-'));
+  t.after(() => fs.rmSync(authDir, {recursive: true, force: true}));
+  const account = {id: 'claude.json', provider: 'claude', email: 'claude@example.com', disabled: false};
+  const admin = {snapshot: async () => ({accounts: [account], users: [{enabled: true, editable: true, accounts: [account.id]}]})};
+  let clock = Date.parse('2026-10-29T18:00:00Z'), mode = 'ok', calls = 0;
+  const management = async (endpoint, input) => {
+    if (endpoint === 'auth-files') return {files: [{id: account.id, type: 'claude', auth_index: 'claude'}]};
+    calls++;
+    if (mode === '429') return {status_code: 429, header: {'Retry-After': ['0']}, body: '{}'};
+    return {status_code: 200, body: JSON.stringify({five_hour: {utilization: 25, resets_at: '2026-10-29T23:00:00Z'}})};
+  };
+  const options = {admin, authDir, management, details: false, now: () => clock};
+  const first = createUsage(options), second = createUsage(options), third = createUsage(options);
+  assert.equal((await first.getForRouting()).accounts[account.id].windows[0].remaining, 75);
+  assert.equal(calls, 1);
+  clock += 30000; mode = '429';
+  assert.equal((await second.getForRouting()).accounts[account.id].windows[0].remaining, 75,
+    'a successful shared observation is reused during the 60-second poll interval');
+  assert.equal(calls, 1);
+  clock += 30001;
+  const [outage, concurrent] = await Promise.all([first.getForRouting(), second.getForRouting()]);
+  assert.equal(calls, 2, 'a provider failure is shared instead of creating a cross-process stampede');
+  assert.equal(outage.accounts[account.id].windows[0].remaining, 75);
+  assert.equal(concurrent.accounts[account.id].windows[0].remaining, 75);
+  assert.equal((await third.getForRouting()).accounts[account.id].windows[0].remaining, 75,
+    'a third instance honors the persisted cooldown instead of retrying at 30 seconds');
+  assert.equal(calls, 2);
+  clock += 60001; mode = 'ok';
+  const recovered = (await third.getForRouting()).accounts[account.id];
+  assert.equal(recovered.windows[0].remaining, 75);
+  assert.equal(calls, 3, 'the next retry recovers after the bounded cooldown');
+  clock += 60001; mode = '429';
+  const nextFailure = (await first.getForRouting()).accounts[account.id];
+  assert.equal(nextFailure.checkedAt, recovered.checkedAt,
+    'a process with an older local cache retains the newer confirmed shared reading after a failed refresh');
+  assert.equal((await second.getForRouting()).accounts[account.id].checkedAt, recovered.checkedAt,
+    'all processes use the newest confirmed observation during the shared cooldown');
+});
+
+test('shared Claude quota keeps profile details local and writes private state', async t => {
+  const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-claude-details-'));
+  t.after(() => fs.rmSync(authDir, {recursive: true, force: true}));
+  const account = {id: 'claude.json', provider: 'claude', email: 'claude@example.com'};
+  const admin = {snapshot: async () => ({accounts: [account], users: [{name: 'member', email: 'member@example.com', enabled: true, editable: true, accounts: [account.id]}]})};
+  let calls = [], failQuota = false;
+  const management = async (endpoint, input) => {
+    if (endpoint === 'auth-files') return {files: [{id: account.id, type: 'claude', auth_index: 'claude'}]};
+    calls.push(input.url);
+    if (input.url.endsWith('/profile')) return {status_code: 200, body: JSON.stringify({account: {has_claude_max: true}, organization: {rate_limit_tier: 'default_claude_max_20x'}})};
+    if (failQuota) return {status_code: 429, body: '{}'};
+    return {status_code: 200, body: JSON.stringify({five_hour: {utilization: 25, resets_at: '2026-10-29T23:00:00Z'}})};
+  };
+  let now = Date.parse('2026-10-29T18:00:00Z');
+  const detailed = createUsage({admin, authDir, management, now: () => now});
+  const routing = createUsage({admin, authDir, management, details: false, now: () => now});
+  const rich = await detailed.getForUser({name: 'member', email: 'member@example.com'});
+  assert.equal(rich.accounts[0].plan, 'Max 20×');
+  assert.deepEqual(calls, ['https://api.anthropic.com/api/oauth/usage', 'https://api.anthropic.com/api/oauth/profile']);
+  const snapshot = await routing.getForRouting();
+  assert.equal(snapshot.accounts[account.id].windows[0].remaining, 75);
+  assert.deepEqual(calls, ['https://api.anthropic.com/api/oauth/usage', 'https://api.anthropic.com/api/oauth/profile'],
+    'routing reuses only the quota read and does not inherit website profile enrichment');
+  const cacheDirectory = path.join(authDir, '.claude-usage-cache');
+  const cache = fs.readdirSync(cacheDirectory).find(name => name.endsWith('.json'));
+  assert.ok(cache);
+  assert.equal(fs.statSync(cacheDirectory).mode & 0o077, 0, 'shared telemetry directory is private');
+  assert.equal(fs.statSync(path.join(cacheDirectory, cache)).mode & 0o077, 0, 'shared quota observations are private');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(cacheDirectory, cache), 'utf8')).record.value.plan, null);
+  now += 31000;
+  assert.equal((await detailed.getForUser({name: 'member', email: 'member@example.com'})).accounts[0].plan, 'Max 20×');
+  assert.equal(calls.length, 2, 'client refreshes must not repeat optional profile reads');
+  now += 30000;
+  assert.equal((await detailed.getForUser({name: 'member', email: 'member@example.com'})).accounts[0].plan, 'Max 20×');
+  assert.equal(calls.filter(url => url.endsWith('/usage')).length, 2, 'quota refreshes still run once a minute');
+  assert.equal(calls.filter(url => url.endsWith('/profile')).length, 1, 'plan metadata is cached independently for fifteen minutes');
+  now += 60000; failQuota = true;
+  const stale = await detailed.getForUser({name: 'member', email: 'member@example.com'});
+  assert.equal(stale.accounts[0].stale, true);
+  assert.equal(stale.accounts[0].plan, 'Max 20×', 'shared quota failures must not erase locally confirmed plan details');
+});
+
+test('separate Node processes serialize a Claude quota read through the file lock', async t => {
+  const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-claude-processes-'));
+  const counter = path.join(authDir, 'provider-count');
+  t.after(() => fs.rmSync(authDir, {recursive: true, force: true}));
+  const script = `
+    const fs = require('node:fs');
+    const {createUsage} = require(${JSON.stringify(path.join(process.cwd(), 'portal/usage-service.cjs'))});
+    const account = {id: 'claude.json', provider: 'claude', email: 'claude@example.com'};
+    const admin = {snapshot: async () => ({accounts: [account], users: [{enabled: true, editable: true, accounts: [account.id]}]})};
+    const management = async (endpoint, input) => {
+      if (endpoint === 'auth-files') return {files: [{id: account.id, type: 'claude', auth_index: 'claude'}]};
+      fs.appendFileSync(process.env.COUNTER, '1\\n');
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return {status_code: 200, body: JSON.stringify({five_hour: {utilization: 10}})};
+    };
+    createUsage({admin, authDir: process.env.AUTH_DIR, management, details: false,
+      now: () => 1793296800000}).getForRouting().then(result => {
+        if (!result.accounts['claude.json']) process.exitCode = 2;
+      }).catch(() => { process.exitCode = 3; });
+  `;
+  const run = () => new Promise(resolve => {
+    const child = spawn(process.execPath, ['-e', script], {cwd: process.cwd(), env: {...process.env, AUTH_DIR: authDir, COUNTER: counter}});
+    let error = '';
+    child.stderr.on('data', chunk => { error += chunk.toString(); });
+    child.on('close', (code, signal) => resolve({code, signal, error}));
+  });
+  const results = await Promise.all([run(), run()]);
+  assert.deepEqual(results.map(result => result.code), [0, 0], results.map(result => result.error).join('\n'));
+  assert.equal(fs.readFileSync(counter, 'utf8').trim().split('\n').length, 1);
+});
+
+test('Retry-After HTTP dates are honored within the bounded cooldown', async t => {
+  const authDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-claude-retry-date-'));
+  t.after(() => fs.rmSync(authDir, {recursive: true, force: true}));
+  const account = {id: 'claude.json', provider: 'claude', email: 'claude@example.com'};
+  const admin = {snapshot: async () => ({accounts: [account], users: [{enabled: true, editable: true, accounts: [account.id]}]})};
+  let clock = Date.parse('2026-10-29T18:00:00Z'), calls = 0, mode = '429';
+  const management = async (endpoint, input) => {
+    if (endpoint === 'auth-files') return {files: [{id: account.id, type: 'claude', auth_index: 'claude'}]};
+    calls++;
+    if (mode === '429') return {status_code: 429, header: {'retry-after': new Date(clock + 120000).toUTCString()}, body: '{}'};
+    return {status_code: 200, body: JSON.stringify({five_hour: {utilization: 10}})};
+  };
+  const usage = createUsage({admin, authDir, management, details: false, now: () => clock});
+  assert.deepEqual((await usage.getForRouting()).accounts, {});
+  assert.equal(calls, 1);
+  clock += 90000;
+  assert.deepEqual((await usage.getForRouting()).accounts, {});
+  assert.equal(calls, 1, 'the HTTP date keeps the provider read paused');
+  clock += 30001; mode = 'ok';
+  assert.equal((await usage.getForRouting()).accounts[account.id].windows[0].remaining, 90);
+  assert.equal(calls, 2);
 });
 
 test('routing snapshots contain only quota windows for permitted active accounts and preserve observation age on failure', async () => {

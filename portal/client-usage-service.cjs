@@ -5,6 +5,7 @@
 const ROOT = '/usage/v0/management/';
 const CODEX_USAGE = 'https://chatgpt.com/backend-api/wham/usage';
 const CLAUDE_USAGE = 'https://api.anthropic.com/api/oauth/usage';
+const CLAUDE_RATE_LIMIT_GRACE = 5 * 60 * 1000;
 const {CREDIT_URL, ResetError} = require('./reset-credit-service.cjs');
 
 function usageEndpoint(req) {
@@ -52,14 +53,15 @@ function providerBody(account) {
     const value = account.windows.find(w => w.label === label);
     return value ? {utilization: Math.round((100 - value.remaining) * 10) / 10, resets_at: value.resetsAt} : null;
   };
-  return {five_hour: window('5h'), seven_day: window('1w'),
+  return {...account.plan ? {plan_type: `Claude ${account.plan}`} : {},
+    five_hour: window('5h'), seven_day: window('1w'),
     limits: account.windows.filter(w => !['5h', '1w'].includes(w.label)).map(w => ({
       kind: 'weekly_scoped', percent: Math.round((100 - w.remaining) * 10) / 10,
       resets_at: w.resetsAt, scope: {model: {display_name: w.label}},
     }))};
 }
 
-function createClientUsage({usage}) {
+function createClientUsage({usage, now = Date.now}) {
   return async (req, res, identity, stillAuthorized) => {
     try {
       if (!identity?.name || !identity?.email) return json(res, 403, {error: 'Usage access unavailable.'});
@@ -103,8 +105,20 @@ function createClientUsage({usage}) {
           if (!account || (account.provider === 'codex' ? CODEX_USAGE : CLAUDE_USAGE) !== input.url) {
             return json(res, 404, {error: 'Account unavailable.'});
           }
-          if (account.stale || !account.windows.length) return json(res, 503, {error: 'Account usage temporarily unavailable.'});
-          result = {status_code: 200, body: JSON.stringify(providerBody(account))};
+          const observedAt = typeof account.checkedAt === 'string' ? Date.parse(account.checkedAt) : NaN;
+          const current = now();
+          // A short OAuth rate limit need not erase a recent confirmed reading.
+          // Keep its original timestamp and explicit stale flag on the wire;
+          // never use this grace for auth errors, reset crossings or old data.
+          const recentRateLimit = account.provider === 'claude' && account.rateLimited === true &&
+            Number.isFinite(observedAt) && observedAt <= current && current - observedAt < CLAUDE_RATE_LIMIT_GRACE &&
+            account.windows.every(window => window.resetsAt === null ||
+              (typeof window.resetsAt === 'string' && Number.isFinite(Date.parse(window.resetsAt)) && Date.parse(window.resetsAt) > current));
+          if ((account.stale && !recentRateLimit) || !account.windows.length) {
+            return json(res, 503, {error: 'Account usage temporarily unavailable.'});
+          }
+          result = {status_code: 200, body: JSON.stringify(providerBody(account)),
+            ...(account.provider === 'claude' ? {checked_at: account.checkedAt, stale: account.stale} : {})};
         }
       }
       // Devices and membership may be revoked while provider requests are pending.
