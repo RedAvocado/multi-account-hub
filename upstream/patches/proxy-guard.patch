@@ -1,5 +1,5 @@
 diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
-index 7cdacb7..5842a43 100644
+index 7cdacb7..fda674d 100644
 --- a/sdk/cliproxy/auth/conductor_selection.go
 +++ b/sdk/cliproxy/auth/conductor_selection.go
 @@ -28,6 +28,11 @@ func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
@@ -73,7 +73,7 @@ index 7cdacb7..5842a43 100644
  	if !handled {
  		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
  		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
-@@ -2274,6 +2296,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+@@ -2274,12 +2296,18 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
  func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
  	opts.EnsureMetadata()
  	if m.HomeEnabled() {
@@ -83,17 +83,27 @@ index 7cdacb7..5842a43 100644
  		return m.pickNextViaHome(ctx, model, opts, tried)
  	}
  	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+ 
+ 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
++		if hubRequireScheduler {
++			return m.pickNextMixedHub(ctx, providers, model, opts, tried)
++		}
+ 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+ 	}
+ 
 diff --git a/sdk/cliproxy/auth/hub_router_guard_test.go b/sdk/cliproxy/auth/hub_router_guard_test.go
 new file mode 100644
-index 0000000..a3af6eb
+index 0000000..5935885
 --- /dev/null
 +++ b/sdk/cliproxy/auth/hub_router_guard_test.go
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,108 @@
 +package auth
 +
 +import (
 +	"context"
 +	"testing"
++	"time"
 +
 +	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 +	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -131,4 +141,166 @@ index 0000000..a3af6eb
 +	if a, _, err := m.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil); err != nil || a == nil || a.ID != "work" {
 +		t.Fatalf("allowed selection failed: auth=%v err=%v", a, err)
 +	}
++}
++
++func hubWaitManager(t *testing.T, cooldown, maxWait time.Duration) (*Manager, *fakePluginScheduler) {
++	t.Helper()
++	m := NewManager(nil, &RoundRobinSelector{}, nil)
++	m.executors["gemini"] = schedulerTestExecutor{}
++	m.SetRetryConfig(3, maxWait, 0)
++	if _, err := m.Register(context.Background(), &Auth{ID: "exhausted", Provider: "gemini"}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := m.Register(context.Background(), &Auth{ID: "healthy", Provider: "gemini", Unavailable: true, NextRetryAfter: time.Now().Add(cooldown)}); err != nil {
++		t.Fatal(err)
++	}
++	// The router permits only the healthy account; the exhausted one is
++	// host-available but has no quota, so the router rejects without it.
++	scheduler := &fakePluginScheduler{pick: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
++		for _, candidate := range req.Candidates {
++			if candidate.ID == "healthy" {
++				return pluginapi.SchedulerPickResponse{Handled: true, AuthID: "healthy"}, true, nil
++			}
++		}
++		return pluginapi.SchedulerPickResponse{Handled: true, Reject: true, RejectCode: "auth_unavailable", RejectReason: "key-router: none available"}, true, nil
++	}}
++	m.SetPluginScheduler(scheduler)
++	return m, scheduler
++}
++
++func TestHubGuardWaitsForTransientCooldownInsteadOfRejecting(t *testing.T) {
++	m, scheduler := hubWaitManager(t, 200*time.Millisecond, 5*time.Second)
++	started := time.Now()
++	auth, _, _, err := m.pickNextMixed(context.Background(), []string{"gemini"}, "", cliproxyexecutor.Options{}, nil)
++	if err != nil || auth == nil || auth.ID != "healthy" {
++		t.Fatalf("expected the briefly cooling account after a short wait, got auth=%v err=%v", auth, err)
++	}
++	if waited := time.Since(started); waited < 150*time.Millisecond {
++		t.Fatalf("selection did not wait for the cooldown: %v", waited)
++	}
++	if scheduler.calls < 2 {
++		t.Fatalf("router was not consulted again after the wait: %d calls", scheduler.calls)
++	}
++}
++
++func TestHubGuardRejectsWhenCooldownExceedsRetryInterval(t *testing.T) {
++	m, scheduler := hubWaitManager(t, time.Hour, time.Second)
++	started := time.Now()
++	auth, _, _, err := m.pickNextMixed(context.Background(), []string{"gemini"}, "", cliproxyexecutor.Options{}, nil)
++	if err == nil || auth != nil {
++		t.Fatalf("expected rejection for a long cooldown, got auth=%v", auth)
++	}
++	if waited := time.Since(started); waited > 500*time.Millisecond {
++		t.Fatalf("long cooldown must fail fast, waited %v", waited)
++	}
++	if scheduler.calls != 1 {
++		t.Fatalf("expected a single router call, got %d", scheduler.calls)
++	}
++}
++
++func TestHubGuardWaitHonorsCancellation(t *testing.T) {
++	m, _ := hubWaitManager(t, 3*time.Second, 5*time.Second)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if auth, _, _, err := m.pickNextMixed(ctx, []string{"gemini"}, "", cliproxyexecutor.Options{}, nil); err == nil || auth != nil {
++		t.Fatalf("canceled request must not wait, got auth=%v err=%v", auth, err)
++	}
++}
+diff --git a/sdk/cliproxy/auth/hub_router_wait.go b/sdk/cliproxy/auth/hub_router_wait.go
+new file mode 100644
+index 0000000..74800c8
+--- /dev/null
++++ b/sdk/cliproxy/auth/hub_router_wait.go
+@@ -0,0 +1,92 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++)
++
++// pickNextMixedHub waits out short cooldowns when the hub account router rejects.
++//
++// The router only sees accounts the host currently considers available. When
++// the accounts a user may still use are briefly cooling down after a transient
++// upstream error, the router rejects although capacity returns within seconds.
++// Waiting for the earliest such cooldown, bounded by max-retry-interval, keeps
++// the request alive instead of surfacing auth_unavailable to the client.
++func (m *Manager) pickNextMixedHub(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
++	_, _, maxWait := m.retrySettings()
++	deadline := time.Now().Add(maxWait)
++	for {
++		auth, executor, provider, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
++		if errPick == nil || !isHubRouterRejection(errPick) {
++			return auth, executor, provider, errPick
++		}
++		wait, ok := m.hubCooldownWait(ctx, providers, model, opts, tried, time.Now(), deadline)
++		if !ok {
++			return nil, nil, "", errPick
++		}
++		if errWait := waitForCooldown(ctx, wait, 0); errWait != nil {
++			return nil, nil, "", errWait
++		}
++	}
++}
++
++func isHubRouterRejection(err error) bool {
++	var authErr *Error
++	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "auth_unavailable"
++}
++
++// hubCooldownWait returns the time until the earliest untried candidate for
++// this request leaves a cooldown that ends no later than deadline.
++func (m *Manager) hubCooldownWait(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, now, deadline time.Time) (time.Duration, bool) {
++	if m == nil || !deadline.After(now) {
++		return 0, false
++	}
++	providerSet := make(map[string]struct{}, len(providers))
++	for _, provider := range providers {
++		if key := canonicalSchedulingProvider(provider); key != "" {
++			providerSet[key] = struct{}{}
++		}
++	}
++	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
++	eligibility := authSelectionEligibilityForRequest(ctx, opts)
++	registryRef := registry.GetGlobalRegistry()
++
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	var earliest time.Time
++	for _, candidate := range m.auths {
++		if candidate == nil || candidate.Disabled {
++			continue
++		}
++		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
++			continue
++		}
++		if !eligibility.allows(candidate) {
++			continue
++		}
++		if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
++			continue
++		}
++		if model != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
++			continue
++		}
++		if _, used := tried[candidate.ID]; used {
++			continue
++		}
++		blocked, reason, next := isAuthBlockedForModel(candidate, m.selectionModelForAuth(candidate, model), now)
++		if !blocked || reason == blockReasonDisabled || !next.After(now) || next.After(deadline) {
++			continue
++		}
++		if earliest.IsZero() || next.Before(earliest) {
++			earliest = next
++		}
++	}
++	if earliest.IsZero() {
++		return 0, false
++	}
++	return earliest.Sub(now), true
 +}

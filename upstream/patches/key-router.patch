@@ -11,7 +11,7 @@ index 2e159d4..22b997e 100644
  require (
  	github.com/router-for-me/CLIProxyAPI/v8 v8.0.0
 diff --git a/main.go b/main.go
-index 3a3a1b3..a4fd6dc 100644
+index 3a3a1b3..cd4378a 100644
 --- a/main.go
 +++ b/main.go
 @@ -50,7 +50,9 @@ import (
@@ -29,7 +29,7 @@ index 3a3a1b3..a4fd6dc 100644
  )
  
 -const pluginVersion = "0.5.0"
-+const pluginVersion = "0.6.1"
++const pluginVersion = "0.6.2"
  
  // configUIPath is the resource path shown as a menu page in the management panel,
  // served at /v0/resource/plugins/key-router/config.
@@ -230,7 +230,7 @@ index 3a3a1b3..a4fd6dc 100644
 +	key := hex.EncodeToString(digest[:])
 +	affinity.Lock()
 +	defer affinity.Unlock()
-+	if binding, ok := affinity.bindings[key]; ok && now.Before(binding.expires) {
++	if binding, ok := affinity.bindings[key]; ok && now.Before(binding.expires) && !drainingWithAlternative(binding.authID, candidates, req.Model, quotas, now) {
 +		// A healthy fallback session remains warm when a primary recovers.
 +		// Primary preference governs new bindings, not every tool call.
 +		for _, candidate := range primary {
@@ -325,135 +325,12 @@ index 3a3a1b3..a4fd6dc 100644
  }
  
  func loadedConfig() *routingTable {
-diff --git a/router_test.go b/router_test.go
-index fa63e3d..61cf0f5 100644
---- a/router_test.go
-+++ b/router_test.go
-@@ -24,6 +24,9 @@ users:
- 
- func configureForTest(t *testing.T) {
- 	t.Helper()
-+	affinity.Lock()
-+	affinity.bindings = map[string]sessionBinding{}
-+	affinity.Unlock()
- 	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(testConfig)})
- 	if err := configure(raw); err != nil {
- 		t.Fatalf("configure: %v", err)
-@@ -32,7 +35,12 @@ func configureForTest(t *testing.T) {
- 
- func pick(t *testing.T, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
- 	t.Helper()
--	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: "m", Options: opts, Candidates: candidates})
-+	return pickModel(t, "m", opts, candidates...)
-+}
-+
-+func pickModel(t *testing.T, model string, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
-+	t.Helper()
-+	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: model, Options: opts, Candidates: candidates})
- 	out, err := pickAuth(raw)
- 	if err != nil {
- 		t.Fatalf("pickAuth: %v", err)
-@@ -96,21 +104,88 @@ func TestPrimaryWinsOverAccess(t *testing.T) {
- 	}
- }
- 
--func TestLegacyAuthsFallBackToBuiltin(t *testing.T) {
-+func TestLegacyAuthsRejectUnassigned(t *testing.T) {
- 	configureForTest(t)
- 	legacy := pluginapi.SchedulerAuthCandidate{ID: "claude-legacy@example.com.json"}
- 	if got := pick(t, scope("key-l"), authJ, legacy); got.AuthID != legacy.ID {
- 		t.Fatalf("legacy primary: got %+v", got)
- 	}
--	if got := pick(t, scope("key-l"), authJ); got.Handled {
--		t.Fatalf("legacy fallback should be unhandled, got %+v", got)
-+	if got := pick(t, scope("key-l"), authJ); !got.Handled || !got.Reject {
-+		t.Fatalf("legacy rules must reject unassigned accounts, got %+v", got)
- 	}
- }
- 
--func TestUnknownKeyUnhandled(t *testing.T) {
-+func TestUnknownKeyRejected(t *testing.T) {
- 	configureForTest(t)
--	if got := pick(t, scope("other"), authJ, authM); got.Handled {
--		t.Fatalf("expected unhandled, got %+v", got)
-+	if got := pick(t, scope("other"), authJ, authM); !got.Handled || !got.Reject {
-+		t.Fatalf("expected rejection, got %+v", got)
-+	}
-+}
-+
-+func TestExactAccountRulesAndScopeCannotBeSpoofed(t *testing.T) {
-+	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: team, api-keys: [team-key], primary: [id=codex-work.json]}\n")})
-+	if err := configure(raw); err != nil {
-+		t.Fatal(err)
-+	}
-+	work := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json", Provider: "codex"}
-+	personal := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json-personal", Provider: "codex"}
-+	if got := pick(t, scope("team-key"), personal, work); got.AuthID != work.ID {
-+		t.Fatalf("team must receive only its exact work credential, got %+v", got)
-+	}
-+	if got := pick(t, scope("team-key"), personal); !got.Reject {
-+		t.Fatalf("similar personal credential must be rejected, got %+v", got)
-+	}
-+	opts := scope("not-team-key")
-+	opts.Headers = map[string][]string{"X-Api-Key": {"team-key"}}
-+	if got := pick(t, opts, work); !got.Reject {
-+		t.Fatalf("an authenticated scope must not be overridden by a header, got %+v", got)
-+	}
-+}
-+
-+func TestHubSessionsRotateThenStayOnAllowedAccount(t *testing.T) {
-+	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: affinity-test, api-keys: [k], primary: [id=work-a, id=work-b]}\n")})
-+	if err := configure(raw); err != nil {
-+		t.Fatal(err)
-+	}
-+	a := pluginapi.SchedulerAuthCandidate{ID: "work-a", Provider: "codex"}
-+	b := pluginapi.SchedulerAuthCandidate{ID: "work-b", Provider: "codex"}
-+	personal := pluginapi.SchedulerAuthCandidate{ID: "personal", Provider: "codex"}
-+	options := func(id string) pluginapi.SchedulerOptions {
-+		o := scope("k")
-+		o.Headers = map[string][]string{"Session-Id": {id}}
-+		return o
-+	}
-+	first := pick(t, options("one"), personal, a, b)
-+	second := pick(t, options("two"), personal, a, b)
-+	if first.Reject || second.Reject || first.AuthID == "personal" || second.AuthID == "personal" {
-+		t.Fatalf("sessions were not distributed across permitted accounts: %+v %+v", first, second)
-+	}
-+	if again := pick(t, options("one"), personal, b, a); again.AuthID != first.AuthID {
-+		t.Fatalf("same session changed accounts: before=%+v after=%+v", first, again)
-+	}
-+	if lostWork := pick(t, options("one"), personal); !lostWork.Reject {
-+		t.Fatalf("team session fell back to personal account: %+v", lostWork)
-+	}
-+}
-+
-+func TestHealthyFallbackSessionStaysWarmWhenPrimaryRecovers(t *testing.T) {
-+	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: recovered-primary-test, api-keys: [k], primary: [id=work-primary.json], access: [id=work-fallback.json]}\n")})
-+	if err := configure(raw); err != nil {
-+		t.Fatal(err)
-+	}
-+	primary := pluginapi.SchedulerAuthCandidate{ID: "work-primary.json", Provider: "codex"}
-+	fallback := pluginapi.SchedulerAuthCandidate{ID: "work-fallback.json", Provider: "codex"}
-+	opts := scope("k")
-+	opts.Headers = map[string][]string{"Session-Id": {"warm-fallback"}}
-+	if got := pick(t, opts, fallback); got.AuthID != fallback.ID {
-+		t.Fatalf("expected fallback during primary outage: %+v", got)
-+	}
-+	if got := pick(t, opts, primary, fallback); got.AuthID != fallback.ID {
-+		t.Fatalf("primary recovery must not disrupt an active cache: %+v", got)
-+	}
-+	opts.Headers["Session-Id"] = []string{"new-session"}
-+	if got := pick(t, opts, primary, fallback); got.AuthID != primary.ID {
-+		t.Fatalf("new sessions must still honor primary preference: %+v", got)
- 	}
- }
- 
 diff --git a/quota.go b/quota.go
 new file mode 100644
-index 0000000..8015f4c
+index 0000000..61aad7d
 --- /dev/null
 +++ b/quota.go
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,283 @@
 +package main
 +
 +import (
@@ -473,6 +350,37 @@ index 0000000..8015f4c
 +)
 +
 +const quotaMaxAge = 3 * time.Minute
++
++// admissionReserve is the headroom percentage below which an account is
++// draining: new sessions avoid it, and pinned sessions leave it, whenever a
++// healthier permitted account exists. Leaving before the provider rejects
++// keeps a usage-limit error from ever reaching the client.
++const admissionReserve = 3.0
++
++// drainingWithAlternative reports whether a pinned account is at or below the
++// reserve while another candidate still has known healthy headroom.
++func drainingWithAlternative(authID string, candidates []pluginapi.SchedulerAuthCandidate, model string, snapshot quotaSnapshot, now time.Time) bool {
++	draining := false
++	for _, candidate := range candidates {
++		if candidate.ID != authID {
++			continue
++		}
++		headroom, known := quotaHeadroom(candidate, model, snapshot, now)
++		draining = known && headroom <= admissionReserve
++	}
++	if !draining {
++		return false
++	}
++	for _, candidate := range candidates {
++		if candidate.ID == authID {
++			continue
++		}
++		if headroom, known := quotaHeadroom(candidate, model, snapshot, now); known && headroom > admissionReserve {
++			return true
++		}
++	}
++	return false
++}
 +
 +type quotaWindow struct {
 +	Label           string     `json:"label"`
@@ -621,13 +529,13 @@ index 0000000..8015f4c
 +	healthy, totalKnown, unknown := false, 0.0, 0
 +	for i, candidate := range candidates {
 +		weights[i], known[i], headrooms[i] = quotaScore(candidate, model, snapshot, now)
-+		if known[i] && headrooms[i] > 3 {
++		if known[i] && headrooms[i] > admissionReserve {
 +			healthy = true
 +		}
 +	}
 +	for i := range candidates {
 +		if known[i] {
-+			if healthy && headrooms[i] <= 3 {
++			if healthy && headrooms[i] <= admissionReserve {
 +				weights[i] = 0
 +			}
 +			totalKnown += weights[i]
@@ -708,10 +616,10 @@ index 0000000..8015f4c
 +}
 diff --git a/quota_test.go b/quota_test.go
 new file mode 100644
-index 0000000..3da9331
+index 0000000..0bbb556
 --- /dev/null
 +++ b/quota_test.go
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,449 @@
 +package main
 +
 +import (
@@ -808,7 +716,8 @@ index 0000000..3da9331
 +			}}
 +			first, _ := bestForSession(user, req, candidates, nil, snapshot, now)
 +			values := map[string]float64{"a": 99, "b": 99}
-+			values[first] = 1 // New bindings must choose the other account.
++			// Just above the reserve: the binding stays, new bindings avoid it.
++			values[first] = admissionReserve + 1
 +			_, changed := weightedFixture(now, values)
 +			for i := 0; i < 100; i++ {
 +				req.Options.Metadata[metadataKey] = fmt.Sprint(i)
@@ -1070,7 +979,8 @@ index 0000000..3da9331
 +	opts := pluginapi.SchedulerOptions{Metadata: map[string]any{"canonical_session_id": "canonical"}, Headers: map[string][]string{"Session-Id": {"header-one"}}}
 +	req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6-sol", Options: opts}
 +	first, _ := bestForSession(user, req, candidates, nil, snapshot, now)
-+	_, changed := weightedFixture(now, map[string]float64{"a": 1, "b": 99})
++	// Quotas above the admission reserve never move an established session.
++	_, changed := weightedFixture(now, map[string]float64{"a": 4, "b": 99})
 +	for i := 0; i < 1000; i++ {
 +		req.Options.Headers["Session-Id"] = []string{fmt.Sprint(i)}
 +		if got, _ := bestForSession(user, req, candidates, nil, changed, now); got != first {
@@ -1108,3 +1018,177 @@ index 0000000..3da9331
 +		}
 +	}
 +}
++
++func TestDrainingPinnedSessionLeavesBeforeProviderRejects(t *testing.T) {
++	now := time.Now()
++	user := &userConfig{Name: "draining-test"}
++	req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6.1-sol", Options: pluginapi.SchedulerOptions{
++		Metadata: map[string]any{"canonical_session_id": "draining-session"},
++	}}
++	candidates, snapshot := weightedFixture(now, map[string]float64{"a": 80, "b": 80})
++	first, _ := bestForSession(user, req, candidates, nil, snapshot, now)
++	other := "a"
++	if first == "a" {
++		other = "b"
++	}
++	// The pinned account reaches the reserve while another account is healthy:
++	// the session moves now instead of waiting for a provider usage-limit error.
++	_, draining := weightedFixture(now, map[string]float64{first: admissionReserve, other: 60})
++	if got, _ := bestForSession(user, req, candidates, nil, draining, now); got != other {
++		t.Fatalf("draining pinned account %s kept the session, got %s", first, got)
++	}
++	// The new binding stays warm when the original account recovers.
++	if got, _ := bestForSession(user, req, candidates, nil, snapshot, now); got != other {
++		t.Fatalf("recovered account stole the moved session, got %s", got)
++	}
++	// Without a healthy alternative the session keeps its account rather than
++	// bouncing between two draining accounts or rejecting the request.
++	_, bothLow := weightedFixture(now, map[string]float64{"a": 2, "b": 2})
++	if got, _ := bestForSession(user, req, candidates, nil, bothLow, now); got != other {
++		t.Fatalf("session moved without a healthy alternative, got %s", got)
++	}
++	// Claude accounts follow the same rule for their tightest window.
++	claudeReq := pluginapi.SchedulerPickRequest{Provider: "claude", Model: "claude-opus-5-5", Options: pluginapi.SchedulerOptions{
++		Metadata: map[string]any{"canonical_session_id": "claude-draining-session"},
++	}}
++	claude := []pluginapi.SchedulerAuthCandidate{{ID: "c1", Provider: "claude"}, {ID: "c2", Provider: "claude"}}
++	window := func(fiveHour, weekly float64) []quotaWindow {
++		return []quotaWindow{{Label: "5h", Remaining: &fiveHour}, {Label: "1w", Remaining: &weekly}}
++	}
++	claudeSnapshot := quotaSnapshot{Version: 1, Accounts: map[string]accountQuota{
++		"c1": {Provider: "claude", CheckedAt: now, Windows: window(70, 70)},
++		"c2": {Provider: "claude", CheckedAt: now, Windows: window(70, 70)},
++	}}
++	pinned, _ := bestForSession(user, claudeReq, claude, nil, claudeSnapshot, now)
++	spare := "c1"
++	if pinned == "c1" {
++		spare = "c2"
++	}
++	claudeSnapshot.Accounts[pinned] = accountQuota{Provider: "claude", CheckedAt: now, Windows: window(1, 70)}
++	if got, _ := bestForSession(user, claudeReq, claude, nil, claudeSnapshot, now); got != spare {
++		t.Fatalf("Claude session stayed on an account with an exhausted 5h window, got %s", got)
++	}
++}
+diff --git a/router_test.go b/router_test.go
+index fa63e3d..61cf0f5 100644
+--- a/router_test.go
++++ b/router_test.go
+@@ -24,6 +24,9 @@ users:
+ 
+ func configureForTest(t *testing.T) {
+ 	t.Helper()
++	affinity.Lock()
++	affinity.bindings = map[string]sessionBinding{}
++	affinity.Unlock()
+ 	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(testConfig)})
+ 	if err := configure(raw); err != nil {
+ 		t.Fatalf("configure: %v", err)
+@@ -32,7 +35,12 @@ func configureForTest(t *testing.T) {
+ 
+ func pick(t *testing.T, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
+ 	t.Helper()
+-	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: "m", Options: opts, Candidates: candidates})
++	return pickModel(t, "m", opts, candidates...)
++}
++
++func pickModel(t *testing.T, model string, opts pluginapi.SchedulerOptions, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
++	t.Helper()
++	raw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Model: model, Options: opts, Candidates: candidates})
+ 	out, err := pickAuth(raw)
+ 	if err != nil {
+ 		t.Fatalf("pickAuth: %v", err)
+@@ -96,21 +104,88 @@ func TestPrimaryWinsOverAccess(t *testing.T) {
+ 	}
+ }
+ 
+-func TestLegacyAuthsFallBackToBuiltin(t *testing.T) {
++func TestLegacyAuthsRejectUnassigned(t *testing.T) {
+ 	configureForTest(t)
+ 	legacy := pluginapi.SchedulerAuthCandidate{ID: "claude-legacy@example.com.json"}
+ 	if got := pick(t, scope("key-l"), authJ, legacy); got.AuthID != legacy.ID {
+ 		t.Fatalf("legacy primary: got %+v", got)
+ 	}
+-	if got := pick(t, scope("key-l"), authJ); got.Handled {
+-		t.Fatalf("legacy fallback should be unhandled, got %+v", got)
++	if got := pick(t, scope("key-l"), authJ); !got.Handled || !got.Reject {
++		t.Fatalf("legacy rules must reject unassigned accounts, got %+v", got)
+ 	}
+ }
+ 
+-func TestUnknownKeyUnhandled(t *testing.T) {
++func TestUnknownKeyRejected(t *testing.T) {
+ 	configureForTest(t)
+-	if got := pick(t, scope("other"), authJ, authM); got.Handled {
+-		t.Fatalf("expected unhandled, got %+v", got)
++	if got := pick(t, scope("other"), authJ, authM); !got.Handled || !got.Reject {
++		t.Fatalf("expected rejection, got %+v", got)
++	}
++}
++
++func TestExactAccountRulesAndScopeCannotBeSpoofed(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: team, api-keys: [team-key], primary: [id=codex-work.json]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	work := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json", Provider: "codex"}
++	personal := pluginapi.SchedulerAuthCandidate{ID: "codex-work.json-personal", Provider: "codex"}
++	if got := pick(t, scope("team-key"), personal, work); got.AuthID != work.ID {
++		t.Fatalf("team must receive only its exact work credential, got %+v", got)
++	}
++	if got := pick(t, scope("team-key"), personal); !got.Reject {
++		t.Fatalf("similar personal credential must be rejected, got %+v", got)
++	}
++	opts := scope("not-team-key")
++	opts.Headers = map[string][]string{"X-Api-Key": {"team-key"}}
++	if got := pick(t, opts, work); !got.Reject {
++		t.Fatalf("an authenticated scope must not be overridden by a header, got %+v", got)
++	}
++}
++
++func TestHubSessionsRotateThenStayOnAllowedAccount(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: affinity-test, api-keys: [k], primary: [id=work-a, id=work-b]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	a := pluginapi.SchedulerAuthCandidate{ID: "work-a", Provider: "codex"}
++	b := pluginapi.SchedulerAuthCandidate{ID: "work-b", Provider: "codex"}
++	personal := pluginapi.SchedulerAuthCandidate{ID: "personal", Provider: "codex"}
++	options := func(id string) pluginapi.SchedulerOptions {
++		o := scope("k")
++		o.Headers = map[string][]string{"Session-Id": {id}}
++		return o
++	}
++	first := pick(t, options("one"), personal, a, b)
++	second := pick(t, options("two"), personal, a, b)
++	if first.Reject || second.Reject || first.AuthID == "personal" || second.AuthID == "personal" {
++		t.Fatalf("sessions were not distributed across permitted accounts: %+v %+v", first, second)
++	}
++	if again := pick(t, options("one"), personal, b, a); again.AuthID != first.AuthID {
++		t.Fatalf("same session changed accounts: before=%+v after=%+v", first, again)
++	}
++	if lostWork := pick(t, options("one"), personal); !lostWork.Reject {
++		t.Fatalf("team session fell back to personal account: %+v", lostWork)
++	}
++}
++
++func TestHealthyFallbackSessionStaysWarmWhenPrimaryRecovers(t *testing.T) {
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("users:\n  - {name: recovered-primary-test, api-keys: [k], primary: [id=work-primary.json], access: [id=work-fallback.json]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	primary := pluginapi.SchedulerAuthCandidate{ID: "work-primary.json", Provider: "codex"}
++	fallback := pluginapi.SchedulerAuthCandidate{ID: "work-fallback.json", Provider: "codex"}
++	opts := scope("k")
++	opts.Headers = map[string][]string{"Session-Id": {"warm-fallback"}}
++	if got := pick(t, opts, fallback); got.AuthID != fallback.ID {
++		t.Fatalf("expected fallback during primary outage: %+v", got)
++	}
++	if got := pick(t, opts, primary, fallback); got.AuthID != fallback.ID {
++		t.Fatalf("primary recovery must not disrupt an active cache: %+v", got)
++	}
++	opts.Headers["Session-Id"] = []string{"new-session"}
++	if got := pick(t, opts, primary, fallback); got.AuthID != primary.ID {
++		t.Fatalf("new sessions must still honor primary preference: %+v", got)
+ 	}
+ }
+ 

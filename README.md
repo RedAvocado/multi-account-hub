@@ -93,12 +93,20 @@ adds a small bonus. Every applicable window counts, so an empty weekly quota
 cannot be offset by a full five-hour quota. Claude model-specific limits apply
 only to that model family; Cowork limits do not constrain coding requests.
 
-The selection keeps a 3% reserve for existing sessions when healthier accounts
-are available. Healthy sessions stay on the same account for prompt caching,
-with a one-hour idle timeout. At an observed, unrounded zero, subsequent
-requests move to another permitted account. A provider quota rejection before
+New sessions avoid accounts within a 3% reserve when healthier accounts are
+available. Healthy sessions stay on the same account for prompt caching, with a
+one-hour idle timeout. Once a session's account drains into the reserve and
+another permitted account is healthy, the session's next request moves there,
+so members never reach the provider's usage-limit error. Without a healthy
+alternative, the session keeps its account. A provider quota rejection before
 streaming also retries another available account. Responses already streaming
 are not replayed, which avoids duplicate output or tool calls.
+
+A transient upstream error (5xx or network) parks an account for 5 seconds
+(`transient-error-cooldown-seconds` in `guarded-config.yaml`). When a member's
+only usable accounts are parked like this, the request waits for the earliest
+one to return, bounded by `max-retry-interval`, instead of failing with
+`auth_unavailable`.
 
 The monitor refreshes private quota data roughly once a minute into
 `routing-usage.json`; selection makes no provider calls. Observations older
