@@ -114,6 +114,18 @@ test('a non-admin member can read and redeem an assigned account reset and clear
   assert.equal((await f.clear()).status, 409);
 });
 
+test('members with reset access disabled retain usage access but cannot read, redeem or clear resets', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.usage.getForUser(f.identity)).accounts[0].windows[0].remaining, 0);
+  assert.equal((await f.consume()).status, 200);
+  f.user.allowResets = false;
+  assert.equal((await f.usage.getForUser(f.identity)).accounts[0].windows[0].remaining, 100);
+  assert.equal((await f.read()).status, 403);
+  assert.equal((await f.consume()).status, 403);
+  assert.equal((await f.clear()).status, 403);
+  assert.equal(f.state.clears.length, 0);
+});
+
 test('foreign, personal, revoked and malformed reset requests cannot mutate provider accounts', async t => {
   const f = await fixture(t);
   for (const data of [{}, {...f.selection, credit_id: '../bad'}, {...f.selection, extra: true}, {...f.selection, redeem_request_id: 'bad'}]) {

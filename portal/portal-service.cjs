@@ -36,7 +36,16 @@ function browserCookie(name, value, seconds) {
   return `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${seconds}`;
 }
 
-function createPortal({directory, origin, callbackOrigin = origin, callbackPath = '/oauth/callback', workspaceDomain, oauth, admin, usage, claudeConnect, providerConnect, devices, notifyDevice, now = Date.now}) {
+function createPortal({directory, origin, callbackOrigin = origin, callbackPath = '/oauth/callback', sites: siteList, workspaceDomain, oauth, admin, usage, claudeConnect, providerConnect, devices, notifyDevice, now = Date.now}) {
+  // Each site is a public address for this same website. Sign-in, CSRF and
+  // redirects stay on the address the browser used.
+  const sites = (siteList || [{origin, callbackOrigin, callbackPath}]).map(site => {
+    const callback = site.callbackOrigin || site.origin;
+    const pathName = site.callbackPath || '/oauth/callback';
+    return Object.freeze({origin: site.origin, host: new URL(site.origin).host, callbackOrigin: callback,
+      callbackHost: new URL(callback).host, callbackPath: pathName, redirectUri: callback + pathName});
+  });
+  if (!sites.length || new Set(sites.map(site => site.host)).size !== sites.length) throw new Error('Portal sites must be unique');
   if (typeof workspaceDomain !== 'string' || !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(workspaceDomain)) throw new Error('A workspace domain is required');
   const flows = new Map();
   const relays = new Map();
@@ -211,14 +220,14 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
   function brand() {
     return '<a class="brand" href="/"><img src="/dittodub-white.svg" alt="DittoDub" width="104" height="15"><span>Multi-Account Hub</span></a>';
   }
-  function page(current, message = '') {
+  function page(current, message = '', siteOrigin = sites[0].origin) {
     if (!current) {
       return shell('Multi-Account Hub', `<main class="welcome"><section class="card hero">${brand()}<h1>Every Claude and Codex account, one hub.</h1><p>Sign in with your ${escapeHtml(workspaceDomain)} Google account to see usage, connect a computer, or add an account.</p><a class="button" href="/sign-in">Sign in with Google</a>${message ? `<p class="error">${escapeHtml(message)}</p>` : ''}</section></main>`);
     }
     const admin = current.isAdmin ? `<section class="card" id="admin"><h2>Team access</h2><p class="lead">Choose which shared accounts each person can use. Personal accounts stay with their owners.</p><div id="admin-list"><p class="muted">Loading access settings…</p></div><p id="admin-status" class="status" role="status"></p></section><section class="card" id="admin-devices"><div class="card-heading"><div><h2>Computers</h2><p class="lead">Registered computers and the address each was last seen from.</p></div><button id="devices-refresh" type="button" class="secondary small">Refresh</button></div><div id="devices-list"><p class="muted">Loading computers…</p></div><p class="note">The hub computer may also use a direct local connection, which is not listed. Addresses can change and are never used as an access rule.</p><p id="devices-status" class="status" role="status"></p></section>` : '';
     return shell('Multi-Account Hub', `<header class="topbar">${brand()}<div class="session"><p>Signed in as <strong>${escapeHtml(current.email)}</strong></p><button id="logout" type="button" class="secondary small">Sign out</button></div></header><main>`
       + `<section class="card" id="usage"><div class="card-heading"><div><h2>Usage</h2><p class="lead">Accounts you can use. Usage and burn rates refresh every minute.</p></div><button id="usage-refresh" type="button" class="secondary small">Refresh</button></div><div id="usage-list" aria-live="polite"><p class="muted">Loading usage…</p></div></section>`
-      + `<section class="card setup-section"><h2>Connect a computer</h2><p class="lead">Create a setup prompt, then paste it into the coding assistant on the computer where you use T3 Code.</p><button id="setup" type="button">Create setup prompt</button><div id="result" hidden><p class="note">This prompt contains a private one-time code. It expires in two hours.</p><pre id="setup-prompt" tabindex="0"></pre><div class="actions"><button id="copy-prompt" type="button">Copy prompt</button><p id="copy-status" class="status" role="status"></p></div><details><summary>Set up in Terminal instead</summary><p>Your one-time setup code:</p><code id="code"></code><p>Run this, then paste the code when asked:</p><pre>setup_dir="$(mktemp -d)" &amp;&amp; curl -fsS ${escapeHtml(origin)}/setup-provider-hub.sh -o "$setup_dir/setup.sh" &amp;&amp; bash "$setup_dir/setup.sh"</pre><p class="note">The script saves a private connection on this computer and explains how to add HUB Codex and HUB Claude to T3 Code.</p></details></div><p id="error" role="alert"></p></section>`
+      + `<section class="card setup-section"><h2>Connect a computer</h2><p class="lead">Create a setup prompt, then paste it into the coding assistant on the computer where you use T3 Code. If T3 Code is not installed yet, copy it with installation instructions and the assistant will install and verify everything.</p><button id="setup" type="button">Create setup prompt</button><div id="result" hidden><p class="note">This prompt contains a private one-time code. It expires in two hours.</p><pre id="setup-prompt" tabindex="0"></pre><div class="actions"><button id="copy-prompt" type="button">Copy prompt</button><button id="copy-install-prompt" type="button" class="secondary">Copy with instructions to install T3 Code</button><p id="copy-status" class="status" role="status"></p></div><details><summary>Set up in Terminal instead</summary><p>Your one-time setup code:</p><code id="code"></code><p>Run this, then paste the code when asked:</p><pre>setup_dir="$(mktemp -d)" &amp;&amp; curl -fsS ${escapeHtml(siteOrigin)}/setup-provider-hub.sh -o "$setup_dir/setup.sh" &amp;&amp; bash "$setup_dir/setup.sh"</pre><p class="note">The script saves a private connection on this computer and explains how to add HUB Codex and HUB Claude to T3 Code.</p></details></div><p id="error" role="alert"></p></section>`
       + `<section class="card" id="provider-connect"><h2>Connect an account</h2><p class="lead">Add your own Claude or Codex account and choose who can use it.</p><form id="provider-start-form"><div class="fields"><div><label for="provider-type">Provider</label><select id="provider-type"><option value="codex">Codex</option><option value="claude">Claude</option></select></div><div><label for="provider-visibility">Sharing</label><select id="provider-visibility"><option value="personal">Personal: only me</option><option value="team">Shared with the team</option></select></div></div><p class="note">Personal accounts are only ever used for you, even by administrators. You can change this later.</p><button type="submit">Connect account</button></form><div id="provider-flow" hidden><p id="provider-instructions"></p><a id="provider-link" class="button" href="#" target="_blank" rel="noopener noreferrer">Open provider sign-in</a><div id="provider-device" hidden><p>Enter this code on the provider sign-in page:</p><code id="provider-code"></code><p class="note">Come back here after you approve it.</p></div><div id="provider-callback-wrap" hidden><p>After approving, your browser may say it cannot connect to localhost. Copy the whole address from the address bar and paste it here.</p><form id="provider-callback-form" autocomplete="off"><label for="provider-callback">Claude callback address</label><input id="provider-callback" type="text" spellcheck="false" autocomplete="off" placeholder="http://localhost:54545/callback?…" required><div class="actions"><button type="submit">Complete sign-in</button></div></form><p class="note">Paste it only here. It contains a short-lived sign-in code.</p></div><button id="provider-cancel" type="button" class="secondary">Cancel</button></div><p id="provider-status" class="status" role="status"></p><h3 class="subheading">Your accounts</h3><div id="owned-accounts"><p class="muted">Loading your accounts…</p></div><p id="owned-status" class="status" role="status"></p></section>`
       + `${admin}</main><meta name="hub-user" content="${escapeHtml(current.name)}"><meta name="hub-csrf" content="${escapeHtml(current.csrf)}"><script src="/portal.js" defer></script>`);
   }
@@ -245,15 +254,15 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
     return true;
   }
 
-  async function finishLogin(req, res, state, code) {
+  async function finishLogin(req, res, state, code, siteIndex) {
     const binding = cookies(req)[BROWSER_COOKIE];
     const flow = /^[A-Za-z0-9_-]{43}$/.test(state || '') ? flows.get(hash(state)) : null;
-    if (!flow || !/^[A-Za-z0-9_-]{43}$/.test(binding || '') || !equals(flow.binding, hash(binding))) {
+    if (!flow || flow.site !== siteIndex || !/^[A-Za-z0-9_-]{43}$/.test(binding || '') || !equals(flow.binding, hash(binding))) {
       return respond(res, 401, page(null, 'Sign-in could not be completed. Please try again.'), 'text/html; charset=utf-8');
     }
     flows.delete(hash(state));
     res.setHeader('Set-Cookie', browserCookie(BROWSER_COOKIE, '', 0));
-    const identity = await oauth.exchange({code, verifier: flow.verifier});
+    const identity = await oauth.exchange({code, verifier: flow.verifier, redirectUri: sites[siteIndex].redirectUri});
     if (!equals(identity?.nonce, flow.nonce)) return respond(res, 401, page(null, 'Sign-in could not be verified.'), 'text/html; charset=utf-8');
     const user = bindIdentity(identity);
     if (!user) return respond(res, 403, page(null, 'This Google account is not enabled for the hub.'), 'text/html; charset=utf-8');
@@ -265,13 +274,19 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
     headers(res);
     try {
       if (!req.url.startsWith('/') || req.url.startsWith('//')) return respond(res, 400, 'Invalid request');
-      const url = new URL(req.url, origin);
-      if (url.origin !== origin) return respond(res, 400, 'Invalid request');
+      const url = new URL(req.url, 'https://portal.invalid');
+      if (url.origin !== 'https://portal.invalid') return respond(res, 400, 'Invalid request');
       const host = req.headers.host;
-      const isPortalHost = host === new URL(origin).host;
-      const isCallbackHost = host === new URL(callbackOrigin).host;
-      const isCallback = req.method === 'GET' && url.pathname === callbackPath &&
-        (callbackPath !== '/' || url.searchParams.has('state') || url.searchParams.has('code') || url.searchParams.has('error'));
+      const callbackRequest = candidate => req.method === 'GET' && url.pathname === candidate.callbackPath &&
+        (candidate.callbackPath !== '/' || url.searchParams.has('state') || url.searchParams.has('code') || url.searchParams.has('error'));
+      const site = sites.find(candidate => candidate.callbackHost === host && callbackRequest(candidate)) ||
+        sites.find(candidate => candidate.host === host) || sites.find(candidate => candidate.callbackHost === host);
+      if (!site) return respond(res, 400, 'Invalid request');
+      const siteIndex = sites.indexOf(site);
+      const origin = site.origin;
+      const isPortalHost = host === site.host;
+      const isCallbackHost = host === site.callbackHost;
+      const isCallback = callbackRequest(site);
       if (!isPortalHost && !(isCallbackHost && isCallback)) {
         if (isCallbackHost && req.method === 'GET' && (url.pathname === '/' || url.pathname === '/sign-in')) return redirect(res, origin + '/');
         return respond(res, 400, 'Invalid request');
@@ -306,14 +321,14 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
         return respond(res, 200, fs.readFileSync(path.join(staticDir, 'portal.js')), 'text/javascript; charset=utf-8');
       }
       if (req.method === 'GET' && url.pathname === '/' && !url.search) {
-        return respond(res, 200, page(session(req)), 'text/html; charset=utf-8');
+        return respond(res, 200, page(session(req), '', origin), 'text/html; charset=utf-8');
       }
       if (req.method === 'GET' && url.pathname === '/sign-in' && !url.search) {
         if (flows.size >= MAX_ENTRIES) return respond(res, 503, 'Sign-in is busy. Please try again.');
         const state = token(), binding = token(), nonce = token(), verifier = token();
         const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
-        const destination = oauth.authorizationUrl({state, nonce, challenge});
-        flows.set(hash(state), {binding: hash(binding), nonce, verifier, expires: now() + TEN_MINUTES});
+        const destination = oauth.authorizationUrl({state, nonce, challenge, redirectUri: site.redirectUri});
+        flows.set(hash(state), {binding: hash(binding), nonce, verifier, site: siteIndex, expires: now() + TEN_MINUTES});
         res.setHeader('Set-Cookie', browserCookie(BROWSER_COOKIE, binding, TEN_MINUTES / 1000));
         return redirect(res, destination);
       }
@@ -321,14 +336,14 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
         if (!isCallbackHost) return respond(res, 404, 'Not found');
         const state = url.searchParams.get('state');
         const flow = /^[A-Za-z0-9_-]{43}$/.test(state || '') ? flows.get(hash(state)) : null;
-        if (!flow || url.searchParams.getAll('state').length !== 1 || url.searchParams.getAll('code').length !== 1 ||
+        if (!flow || flow.site !== siteIndex || url.searchParams.getAll('state').length !== 1 || url.searchParams.getAll('code').length !== 1 ||
             !url.searchParams.get('code') || url.searchParams.get('code').length > 4096 || url.searchParams.has('error')) {
           return respond(res, 401, page(null, 'Sign-in could not be completed. Please try again.'), 'text/html; charset=utf-8');
         }
-        if (callbackOrigin === origin) return await finishLogin(req, res, state, url.searchParams.get('code'));
+        if (site.callbackOrigin === origin) return await finishLogin(req, res, state, url.searchParams.get('code'), siteIndex);
         if (relays.size >= MAX_ENTRIES) return respond(res, 503, 'Sign-in is busy. Please try again.');
         const relay = token();
-        relays.set(hash(relay), {state, code: url.searchParams.get('code'), expires: now() + 90000});
+        relays.set(hash(relay), {state, code: url.searchParams.get('code'), site: siteIndex, expires: now() + 90000});
         return redirect(res, `${origin}/oauth/complete?relay=${relay}`);
       }
       if (req.method === 'GET' && url.pathname === '/oauth/complete' && isPortalHost) {
@@ -336,8 +351,8 @@ function createPortal({directory, origin, callbackOrigin = origin, callbackPath 
         const id = /^[A-Za-z0-9_-]{43}$/.test(relay || '') ? hash(relay) : null;
         const pending = id ? relays.get(id) : null;
         if (pending) relays.delete(id);
-        if (!pending || url.searchParams.getAll('relay').length !== 1) return respond(res, 401, page(null, 'Sign-in expired. Please try again.'), 'text/html; charset=utf-8');
-        return await finishLogin(req, res, pending.state, pending.code);
+        if (!pending || pending.site !== siteIndex || url.searchParams.getAll('relay').length !== 1) return respond(res, 401, page(null, 'Sign-in expired. Please try again.'), 'text/html; charset=utf-8');
+        return await finishLogin(req, res, pending.state, pending.code, siteIndex);
       }
       if (req.method === 'GET' && url.pathname === '/portal/usage' && (!url.search || url.search === '?refresh=1')) {
         const current = session(req);

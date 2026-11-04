@@ -109,6 +109,15 @@ details[open] summary { margin-bottom: 12px; }
 .usage-reset { color: var(--muted); white-space: nowrap; }
 .usage-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--soft); font-size: 12px; margin-top: 8px; }
 .usage-checked, .usage-unavailable { color: var(--faint); font-size: 12px; margin: 8px 0 0; }
+.usage-credits { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--raised); font-size: 12px; }
+.usage-credits-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.usage-credits-balance { color: var(--text); font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.usage-credits-state { color: #bfdbfe; background: rgba(37, 99, 235, .22); border-radius: 999px; padding: 0 8px; font-size: 11px; line-height: 18px; }
+.usage-credits-state.off { color: var(--muted); background: var(--raised); }
+.usage-credits-grant { display: flex; flex-wrap: wrap; gap: 2px 12px; color: var(--soft); margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.usage-credits-expiry { color: var(--muted); white-space: nowrap; }
+.usage-credits-empty { color: var(--faint); font-size: 12px; margin: 8px 0 0; }
+.provider-credits { color: var(--muted); font-size: 12px; margin: -2px 0 10px; }
 .usage-burn { min-width: 0; align-self: start; }
 .usage-burn-heading { color: var(--muted); font-size: 11px; margin: 0 0 9px; }
 .usage-burn-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }

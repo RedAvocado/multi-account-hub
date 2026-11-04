@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 'use strict';
+const fs=require('node:fs');
 const path=require('node:path');
 const {createMonitor}=require('./monitor-service.cjs');
 const {loadHubConfig}=require('./hub-config.cjs');
@@ -9,6 +10,7 @@ const {createRoutingUsage}=require('./routing-usage-service.cjs');
 const {createUsageHistory}=require('./usage-history-service.cjs');
 const {createClaudeExtraUsagePolicy}=require('./claude-extra-usage-policy.cjs');
 const {createResetCreditWatcher}=require('./reset-credit-watcher.cjs');
+const {createCreditUsageWatcher}=require('./credit-usage-watcher.cjs');
 process.umask(0o077);
 const directory=path.join(process.env.HOME,'.local/share/cliproxy-hub');
 const authDir=path.join(process.env.HOME,'.cli-proxy-api');
@@ -18,7 +20,16 @@ const monitor=createMonitor({directory,authDir,hubUrl:hub.portal?hub.hubUrl+'/':
 const usage=createUsage({
   admin:createAdministration({directory,authDir}),authDir,details:false,routingCredits:true,
 });
-const routingUsage=createRoutingUsage({directory,history:createUsageHistory({directory}),usage});
+// Alert once when an account starts spending credits (hub fallback or direct use).
+let creditWatcher;
+try {
+  creditWatcher=createCreditUsageWatcher({directory,enqueue:monitor.enqueue,accountLabel(file){
+    let email;try{email=JSON.parse(fs.readFileSync(path.join(authDir,path.basename(file.id)),'utf8')).email;}catch(_){}
+    return monitor.accountLabel({...file,email});
+  }});
+} catch (_) {console.error('Credit usage watcher could not start; check its private state.');}
+const routingUsage=createRoutingUsage({directory,history:createUsageHistory({directory}),usage,
+  onSnapshot:snapshot=>creditWatcher?.observe(snapshot)});
 const claudePolicy=createClaudeExtraUsagePolicy({directory,authDir});
 // Keep an optional watcher failure isolated from quota feeds and model traffic.
 let resetWatcher;

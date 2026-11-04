@@ -226,8 +226,10 @@ def add_member(gateway, name, email, admin):
     return len(shared)
 
 
-def add_device(gateway, member, device_name):
-    """Issue a key for one computer. Returns the key, which is not stored."""
+def add_device(gateway, member, device_name, usage_only=False):
+    """Issue a key for one computer. Returns the key, which is not stored.
+
+    A usage-only key can read GET /v1/usage and nothing else."""
     gw = user_record(gateway['users'], member)
     if gw.get('enabled') is not True:
         raise ValueError('Enable this member before adding a computer.')
@@ -241,6 +243,8 @@ def add_device(gateway, member, device_name):
     created = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     record = {'name': gw['name'], 'email': gw['email'], 'enabled': True, 'createdAt': created,
               'deviceName': label, 'platform': ''}
+    if usage_only:
+        record['scope'] = 'usage'
     write_private(devices / f'{sha256(key)}.json', json.dumps(record) + '\n')
     return key
 
@@ -291,6 +295,7 @@ def main():
     member = sub.add_parser('add-member'); member.add_argument('user'); member.add_argument('email')
     member.add_argument('--admin', action='store_true')
     device = sub.add_parser('add-device'); device.add_argument('user'); device.add_argument('device_name', nargs='?', default='')
+    device.add_argument('--usage-only', action='store_true', help='key can only read GET /v1/usage')
     sharing = sub.add_parser('share'); sharing.add_argument('account'); sharing.add_argument('owner')
     sharing.add_argument('visibility', choices=('team', 'personal'))
     for name in ('set', 'grant', 'revoke'):
@@ -311,8 +316,9 @@ def main():
             print(f"Added {args.user}, disabled until an account is shared or granted. Then run enable {args.user}.")
         return
     if args.command == 'add-device':
-        key = add_device(gateway, args.user, args.device_name)
-        print(f"Device key for {args.user} (shown once, works on one computer):\n\n  {key}\n")
+        key = add_device(gateway, args.user, args.device_name, args.usage_only)
+        kind = 'Usage-only key' if args.usage_only else 'Device key'
+        print(f"{kind} for {args.user} (shown once):\n\n  {key}\n")
         print('On that computer, run this and paste the key when asked:\n')
         print(f'  setup_dir="$(mktemp -d)" && curl -fsS {hub_url()}/setup-provider-hub.sh -o "$setup_dir/setup.sh" && bash "$setup_dir/setup.sh" --key')
         return
@@ -327,7 +333,9 @@ def main():
                 record = json.loads(file.read_text())
                 if args.user and str(record.get('name', '')).lower() != args.user.lower():
                     continue
-                print(f"{file.stem[:16]}  {record.get('name', '?')}  {record.get('createdAt', '?')}")
+                scope = '  usage-only' if record.get('scope') == 'usage' else ''
+                label = f"  {record['deviceName']}" if record.get('deviceName') else ''
+                print(f"{file.stem[:16]}  {record.get('name', '?')}  {record.get('createdAt', '?')}{label}{scope}")
             return
         prefix = args.device_id.lower()
         if not re.fullmatch(r'[a-f0-9]{12,64}', prefix):

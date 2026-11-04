@@ -100,7 +100,9 @@ function createAdministration({directory, authDir, management = managementClient
   }
   function gatewayUsers() {
     const config = gatewayDocument();
-    return config.users.map(user => ({name: user.name, email: user.email, enabled: user.enabled === true, role: user.role === 'admin' ? 'admin' : 'member', owner: user.owner === true}));
+    return config.users.map(user => ({name: user.name, email: user.email, enabled: user.enabled === true,
+      role: user.role === 'admin' ? 'admin' : 'member', owner: user.owner === true,
+      allowResets: user.allowResets !== false}));
   }
   function validateConfig(config) {
     if (!config || config.enabled !== true || !Array.isArray(config.users)) throw new AdminError(503, 'Account routing is unavailable.');

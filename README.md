@@ -102,6 +102,24 @@ alternative, the session keeps its account. A provider quota rejection before
 streaming also retries another available account. Responses already streaming
 are not replayed, which avoids duplicate output or tool calls.
 
+Provider credits are a fallback. Some Codex accounts carry promotional or
+purchased credits that let the provider keep serving an account after its plan
+quota is used up. The router spends them only when every plan the member may
+use for that provider is used up: until then, a used-up account stays out of
+rotation even if it has credits. Primary accounts' credits are used before
+access accounts'. A session on credits moves back to plan quota as soon as any
+permitted plan has headroom again. Missing, stale or capped credit data never
+counts as usable. Claude's equivalent, extra usage, is billed and stays off (see
+below), so Claude accounts never fall back to credits.
+
+The Usage section shows each account's credit balance, every grant with its
+expiry date, and a provider total. The monitor compares credit balances on
+every quota refresh. When an account's balance starts falling, Discord gets one
+alert per spending episode (an episode ends after an hour without spending).
+The alert says whether the hub fell back to credits or whether other plans
+still had quota, which points to use outside the hub. The private
+`credit-usage-watcher.json` keeps balances across restarts.
+
 A transient upstream error (5xx or network) parks an account for 5 seconds
 (`transient-error-cooldown-seconds` in `guarded-config.yaml`). When a member's
 only usable accounts are parked like this, the request waits for the earliest
@@ -236,6 +254,19 @@ URI is your `hubUrl` followed by `/`. Store its `GOOGLE_CLIENT_ID` and
 `GOOGLE_CLIENT_SECRET` in the private file named by
 `portal.googleCredentialsFile`. Then load the `portal` and `tunnel` agents.
 
+To serve the same website on another address, add it to `alternateUrls` and
+to `portal.additionalSites`, route its hostname through the tunnel, and add
+its redirect URI (by default the address followed by `/oauth/callback`) to the
+Google OAuth client. Each address signs in on its own, with its own session.
+
+```json
+"alternateUrls": ["https://hub.example.net"],
+"portal": {
+  "workspaceDomain": "example.com",
+  "additionalSites": [{"url": "https://hub.example.net"}]
+}
+```
+
 **5. Add people and accounts.** Run these from the hub directory:
 
 ```bash
@@ -259,7 +290,12 @@ own accounts in the browser instead.
 **6. Connect computers.**
 
 - **Website:** sign in, click **Create setup prompt**, and paste it into the
-  coding agent on the computer that runs T3 Code.
+  coding agent on the computer that runs T3 Code. On a computer without
+  T3 Code, use **Copy with instructions to install T3 Code** instead. It adds
+  the full macOS install, enrollment, recovery and verification guide, so the
+  agent installs T3 Code, Node.js, Codex and Claude, enrolls with the same
+  one-time code, links every existing MCP server, skill and plugin into the
+  HUB homes, and confirms both HUB providers in fresh conversations.
 - **Tailscale:** run `python3 hub-admin.py add-device alex "Alex's laptop"`. It
   prints a one-time key and the command to run on that computer:
 
@@ -267,47 +303,90 @@ own accounts in the browser instead.
 setup_dir="$(mktemp -d)" && curl -fsS https://hub.your-tailnet.ts.net/setup-provider-hub.sh -o "$setup_dir/setup.sh" && bash "$setup_dir/setup.sh" --key
 ```
 
-The script writes a private Codex home and a Claude launcher under
-`~/.dittodub-provider-hub`. It registers **HUB Codex** and **HUB Claude** in
-T3 Code, syncs the hub's advertised coding models, and registers the hub as a
-T3 usage source. Keep T3 Code running with Codex and Claude installed, and
-Node.js 22+ available while it runs. Rerunning it on a connected computer
-repairs skills sharing, syncs models, and refreshes usage without consuming
-another setup code or replacing credentials.
+The script creates private HUB authentication and runtime homes under
+`~/.dittodub-provider-hub`, registers **HUB Codex** and **HUB Claude** in
+T3 Code, syncs the advertised coding models, and registers the hub as a T3
+usage source. Keep T3 Code running with Codex and Claude installed, and
+Node.js 22+ available. Reruns repair sharing, migrate older installations,
+sync models, and refresh usage without consuming another setup code or
+replacing existing credentials.
+
+HUB Codex links these common files and folders to PERSONAL's `~/.codex`:
+`config.toml`, `skills`, `plugins`, and `AGENTS.md`. This shares MCP
+registrations, plugin installation metadata/cache, skills, instructions,
+and future edits/additions. HUB Claude continues to link its skills to
+`~/.claude/skills`. Missing source folders and empty config/instruction
+files are created. Existing PERSONAL files are never rewritten by setup.
+Changing common settings through either Codex environment changes both.
+
+HUB `auth.json`, the device key, sessions, history, and other runtime files
+stay separate. The private `codex/hub-connection.json` records the endpoint;
+it contains no key. Usage setup reads the private HUB auth/device key,
+never PERSONAL authentication or a credential from the shared config.
+MCP registrations are shared, but integrations that store their own OAuth
+credentials per home may require a separate sign-in.
+
+T3's supported Codex `config.launchArgs` supplies explicit HUB provider,
+endpoint, file-based authentication, and API-key login overrides. A stable
+provider identifier unique to the HUB home avoids inheriting auth fields
+from other provider tables: Codex merges tables even with CLI overrides.
+Keep this generated provider definition out of PERSONAL config. Setup
+rejects a collision with that identifier. The overrides contain no secrets,
+follow existing user arguments, and are not duplicated on reruns. PERSONAL's
+default provider and authentication are preserved. Launch Codex through the
+configured HUB provider in T3; setting `CODEX_HOME` alone does not select
+HUB routing.
 
 Model discovery reads the authenticated hub `/v1/models` endpoint. OpenAI
 coding models go to Codex; Anthropic Claude models go to Claude. Image/audio
-models and internal helpers are excluded from the coding picker. T3's CLI
-catalog can lag behind the hub, especially for API-key connections, so setup
-adds missing models through T3's supported custom-model settings. Existing
-custom models, provider names, launch settings, disabled states, and model
-preferences are preserved. Matching providers are reused by their configured
-home directory. A conflicting provider ID is reported instead of overwritten.
+models and internal helpers are excluded. Missing coding models are added
+through T3's supported custom-model settings. Existing custom models,
+provider names, unrelated launch arguments, disabled states, model preferences,
+and other providers are preserved. Matching providers are reused by their
+configured home. Provider ID collisions, malformed launch arguments,
+`shadowHomePath`, and explicit `T3CODE_CODEX_LAUNCH_ARGS` overrides are
+reported for resolution rather than silently overwritten. An override
+in T3's own process environment also needs to be removed there.
 
-Setup refreshes T3 and checks that the enabled hub providers are ready and
-contain the advertised coding models. Missing CLIs, authentication failures,
-and model discovery failures are reported; resolve them and rerun. Models
-are synchronized on each setup run, not continuously: rerun after new hub
-models or account access are added. The older `setup-hub-usage.cjs` command
-also syncs providers and models; use `setup-provider-hub.sh` to repair skills
-sharing as well. Legacy Codex-only homes remain Codex-only.
+Migration accepts the old generated minimal HUB config or an owned HUB
+config link directly to `~/.codex/config.toml` with private HUB auth/device
+credentials. Before linking, it backs up the old minimal config and empty
+or built-in-only folders under `~/.dittodub-provider-hub/backups`. Those
+backups can contain the old device credential and remain private.
+Custom HUB config, plugins, skills, or instructions stop migration before
+enrollment. Preserve common settings by merging them into PERSONAL, or
+keep HUB-only overrides in T3 launch arguments, then move the old path
+aside and rerun. Do not copy HUB credential fields into PERSONAL.
+Unexpected/broken links, symlinked PERSONAL source paths, unsafe private
+files, and disagreeing HUB credentials are rejected. Interrupted setup
+can be rerun using the saved private connection.
 
-The hub providers use the same local skills as the usual installations:
+Both `setup-provider-hub.sh` and `setup-hub-usage.cjs` migrate the standard
+HUB home. Older nonstandard Codex-only homes remain Codex-only and keep their
+config; their usage and T3 startup routing are updated. Missing standard
+Claude companion files are recreated without replacing existing credentials.
 
-- `~/.dittodub-provider-hub/codex/skills` links to `~/.codex/skills`.
-- `~/.dittodub-provider-hub/claude/skills` links to `~/.claude/skills`.
+Setup saves explicit routing before sharing config, then refreshes T3's
+provider catalog and checks enabled provider readiness and advertised
+models. This refresh is discovery, not a guarantee that an existing cached
+Codex process or conversation reloads its environment. Use a fresh provider
+process/conversation to load the shared environment; if T3 reuses a stale
+process, recover or restart that provider through T3. The installer does
+not restart T3 or terminate active conversations. Rerun setup when new hub
+models or account access are added; catalog sync is not continuous.
 
-These links share edits and future additions automatically. Missing source
-folders are created. Only skills folders are shared; provider configuration
-and credentials remain in the separate hub homes. Skills come from the
-computer running T3 Code, including when that computer also hosts the hub.
+To verify onboarding without touching user state:
 
-When upgrading an older installation, an empty or built-in-only hub skills
-folder is backed up under `~/.dittodub-provider-hub/backups` before linking.
-If a hub skills folder contains custom files or links elsewhere, setup stops
-before reading a setup code and explains what to merge or move. Resolve that
-conflict and rerun the script. Start a new conversation afterward to reload
-skills, and refresh T3 Code if the skill picker is stale.
+```bash
+node --test tests/hub_environment.test.cjs tests/model_setup.test.cjs tests/usage_setup.test.cjs
+python3 tests/setup_google_test.py
+python3 tests/setup_skills_test.py
+HUB_TEST_CODEX_BINARY=/absolute/path/to/codex python3 tests/codex_environment_test.py
+```
+
+The optional last test launches a real Codex app-server with disposable
+homes, synthetic credentials, and local mock HTTP. It checks effective
+startup routing, auth isolation, and shared MCP config without a T3 session.
 
 ## Day to day
 
@@ -324,6 +403,31 @@ node issue-login-link.cjs alex@example.com # website: one-time sign-in link
 Changes apply to new requests, and requests already streaming may finish. To
 retire an account, set `"disabled": true` in its file in `~/.cli-proxy-api`.
 If a Codex account reports `token_invalidated`, sign it in again.
+
+### Usage API
+
+`GET /v1/usage` on the hub address, with a member's hub API key, returns every
+account that member may use. Nobody else's accounts are included, and no
+credentials or internal file names appear.
+
+```bash
+curl -s https://hub.example.com/v1/usage -H "Authorization: Bearer $HUB_KEY"
+```
+
+Each entry in `accounts` has:
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `provider`, `email`, `plan` | Which account (`id` is an opaque hash). |
+| `windows[]` | `label` (`5h`, `1w`, `1mo`, or a Claude model family), `remaining` percent, and `resetsAt`. |
+| `burnRates` | Quota percentage points used per 10 minutes, hour and day (`tenMinutes`, `hour`, `day`), each with `percent`, `observedSeconds` and `windowSeconds`; `basis` names the window measured. `percent` is `null` until five minutes are observed. |
+| `bankedResets`, `resetExpirations[]` | Codex banked resets and when each expires. |
+| `renewsAt` | When the subscription renews, if known. |
+| `credits` | `balance`, `usable`, and `grants[]` with each grant's `remaining`, `granted` and `expiresAt` (Codex); Claude reports `extraUsage` instead. |
+| `checkedAt`, `stale` | When the provider was last read; `stale` means the latest read failed or is old. |
+
+Burn rates use the monitor's background history, so they work without the
+website being open.
 
 ## Security notes
 

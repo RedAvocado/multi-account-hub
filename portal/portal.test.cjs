@@ -96,6 +96,8 @@ test('Google identity, browser session and one-time setup are bound to each auth
     flow = await start();
     assert.equal((await finish(flow, 'casey@example.org', {hd: 'another-managed-domain.example'})).status, 303);
     const jordan = await signedIn('jordan@example.org');
+    const jordanPage = (await request('GET', '/', {cookie: jordan.cookie})).text;
+    assert.match(jordanPage, /id="copy-install-prompt"[^>]*>Copy with instructions to install T3 Code</);
     assert.equal((await request('GET', '/portal/usage')).status, 403);
     const usageResponse = await request('GET', '/portal/usage', {cookie: jordan.cookie});
     assert.equal(usageResponse.status, 200);

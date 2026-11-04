@@ -41,15 +41,18 @@ test('upgrade reuses renamed providers and preserves custom descriptors, credent
   const descriptor = {slug: 'custom-model', name: 'My Model', capabilities: {optionDescriptors: []}};
   const settings = {providerModelPreferences: {renamed: {hiddenModels: ['gpt-6.1-terra']}}, providerInstances: {
     unrelated: {driver: 'codex', config: {homePath: '/another/home', customModels: ['keep']}},
-    renamed: {driver: 'codex', displayName: 'My Hub', enabled: false, environment: {KEEP: 'private-value'},
+    renamed: {driver: 'codex', displayName: 'My Hub', enabled: false, environment: [{name: 'KEEP', value: 'private-value', sensitive: true}],
       config: {homePath: '~/.dittodub-provider-hub/codex', binaryPath: '/my/codex', launchArgs: '--existing',
         customModels: [descriptor, 'gpt-6.1-terra']}}
   }};
   const original = structuredClone(settings);
   const plan = providerPlan(settings, {...options(), catalog: [{instanceId: 'renamed', models: [{slug: 'gpt-6-astra'}]}]});
   const codex = plan.find(x => x.id === 'renamed');
-  assert.equal(codex.changed, false);
-  assert.deepEqual(codex.instance, settings.providerInstances.renamed);
+  assert.equal(codex.changed, true);
+  assert.ok(codex.instance.config.launchArgs.startsWith('--existing '));
+  const expected = structuredClone(settings.providerInstances.renamed);
+  expected.config.launchArgs = codex.instance.config.launchArgs;
+  assert.deepEqual(codex.instance, expected);
   assert.equal(plan.some(x => x.id === 'unrelated'), false);
   assert.deepEqual(settings, original);
 });
@@ -137,4 +140,14 @@ test('a disabled provider is not enabled by model sync', async () => {
     config: {homePath: options().codexHome}}}};
   await syncProviders(fakeClient(settings), {...options(), claudeHome: undefined, claudeBinary: undefined});
   assert.equal(settings.providerInstances.hub_codex.enabled, false);
+});
+
+test('home and launch environment overrides are rejected without mutating settings', () => {
+  for (const extra of [{config: {shadowHomePath: '/another/auth-home'}}, {environment: [{name: 'T3CODE_CODEX_LAUNCH_ARGS', value: '--override'}]}]) {
+    const instance = {driver: 'codex', ...extra, config: {homePath: options().codexHome, ...extra.config}};
+    const settings = {providerInstances: {hub_codex: instance}};
+    const original = structuredClone(settings);
+    assert.throws(() => providerPlan(settings, options()), /overrides its home/);
+    assert.deepEqual(settings, original);
+  }
 });

@@ -13,6 +13,7 @@ const {PassThrough} = require('stream');
 const {createDevices, clientIp} = require('./portal/device-service.cjs');
 const {createAdministration} = require('./portal/admin-service.cjs');
 const {createUsage} = require('./portal/usage-service.cjs');
+const {createUsageHistory} = require('./portal/usage-history-service.cjs');
 const {createClientUsage, usageEndpoint} = require('./portal/client-usage-service.cjs');
 const {loadHubConfig, renderClientScript} = require('./portal/hub-config.cjs');
 
@@ -32,8 +33,9 @@ const perDeviceLimit = 1024;
 const globalLimit = 8192;
 const devices = createDevices({directory});
 const authDir = path.join(process.env.HOME, '.cli-proxy-api');
+// Burn rates come from the monitor's private usage history (read-only here).
 const clientUsage = createClientUsage({usage: createUsage({
-  admin: createAdministration({directory, authDir}), authDir,
+  admin: createAdministration({directory, authDir}), authDir, history: createUsageHistory({directory}),
 })});
 
 function portalEndpoint(req) {
@@ -106,13 +108,16 @@ function validKey(req) {
     if (permitted.length > 1) return null;
     const device = JSON.parse(fs.readFileSync(path.join(directory, 'devices', `${id}.json`), 'utf8'));
     if (!device || device.enabled !== true || !/^[a-z][a-z0-9_-]{0,40}$/.test(device.name || '') || typeof device.email !== 'string') return null;
+    // A usage-only key may read GET /v1/usage and nothing else. Any other
+    // scope value is unknown and fails closed.
+    if (device.scope !== undefined && device.scope !== 'usage') return null;
     const users = config.users.filter(user => user.enabled === true && user.name === device.name &&
       typeof user.email === 'string' && user.email.toLowerCase() === device.email.toLowerCase());
     if (users.length !== 1 || !/^[a-f0-9]{64}$/.test(users[0].keyHash || '')) return null;
     const internalKey = fs.readFileSync(path.join(directory, 'team-keys', `${device.name}.key`), 'utf8').trim();
     const internalHash = crypto.createHash('sha256').update(internalKey).digest();
     if (!/^[A-Za-z0-9_-]{40,128}$/.test(internalKey) || !crypto.timingSafeEqual(internalHash, Buffer.from(users[0].keyHash, 'hex'))) return null;
-    return {id, authorization: `Bearer ${internalKey}`, kind:'device',
+    return {id, authorization: `Bearer ${internalKey}`, kind:'device', scope: device.scope === 'usage' ? 'usage' : 'full',
       identity: {name: users[0].name, email: users[0].email}};
   } catch (_) {
     return null; // Missing or malformed access configuration fails closed.
@@ -178,6 +183,9 @@ const server = http.createServer((req, res) => {
   if (!isUsage && !validEndpoint(req, false)) { res.writeHead(404); res.end('Not found'); return; }
   const key = validKey(req);
   if (!key) { res.writeHead(401); res.end('Unauthorized'); return; }
+  if (key.scope === 'usage' && !(req.method === 'GET' && req.url === '/v1/usage')) {
+    res.writeHead(403); res.end('This key can only read usage'); return;
+  }
   devices.note(key.id,clientIp(req.headers),key.kind);
   const release = reserve(key.id);
   if (!release) { res.writeHead(429); res.end('Too many active requests'); return; }
@@ -200,6 +208,7 @@ server.on('upgrade', (req, client, clientHead) => {
   if (!validEndpoint(req, true)) { rejectedResponse(client, 404); return; }
   const key = validKey(req);
   if (!key) { rejectedResponse(client); return; }
+  if (key.scope === 'usage') { client.end('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 28\r\nConnection: close\r\n\r\nThis key can only read usage'); return; }
   devices.note(key.id,clientIp(req.headers),key.kind);
   const release = reserve(key.id);
   if (!release) { client.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return; }

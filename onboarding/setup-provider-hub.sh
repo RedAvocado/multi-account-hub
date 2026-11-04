@@ -25,69 +25,15 @@ configure_usage() {
   fi
 }
 
-# Share skills with the normal local installations, including on setup reruns.
-# Keep provider homes separate: only the skills directories are linked.
-configure_skills() {
-  python3 - <<'PY'
-import os, pathlib, sys, tempfile
+# Validate every shared path before consuming a code. Actual linking happens
+# after T3 has saved explicit HUB startup overrides, inside the usage helper.
+node "$usage_setup_dir/setup.cjs" --check-environment
 
-home = pathlib.Path.home()
-root = home / '.dittodub-provider-hub'
-pairs = [(home / '.codex' / 'skills', root / 'codex' / 'skills'),
-         (home / '.claude' / 'skills', root / 'claude' / 'skills')]
-try:
-    # Check both providers before changing either one. Custom hub-only skills
-    # need a deliberate merge; never hide or overwrite them during an upgrade.
-    for source, target in pairs:
-        for directory in (root, target.parent):
-            if directory.is_symlink() or (directory.exists() and
-                    (not directory.is_dir() or directory.stat().st_uid != os.getuid())):
-                raise ValueError(f'Cannot safely use provider directory: {directory}')
-        if source.is_symlink() and not source.is_dir():
-            raise ValueError(f'The usual skills folder has a broken link: {source}')
-        if source.exists() and not source.is_dir():
-            raise ValueError(f'The usual skills path is not a directory: {source}')
-        if target.is_symlink():
-            if target.resolve() != source.resolve():
-                raise ValueError(f'{target} already links elsewhere. Keep or merge those skills before linking it to {source}.')
-        elif target.exists():
-            if not target.is_dir() or any(p.name != '.system' for p in target.iterdir()):
-                raise ValueError(f'{target} contains existing files. Merge those skills into {source}, then move the old folder aside and rerun setup.')
-        if source.resolve() == root.resolve() or root.resolve() in source.resolve().parents:
-            raise ValueError(f'The usual skills folder points inside the hub home: {source}')
-
-    for source, target in pairs:
-        source.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if target.is_symlink():
-            continue
-        backup = None
-        if target.exists():
-            backups = root / 'backups'
-            if backups.is_symlink():
-                raise ValueError(f'The backup directory is a symbolic link: {backups}')
-            backups.mkdir(mode=0o700, exist_ok=True)
-            backup = pathlib.Path(tempfile.mkdtemp(prefix='skills-', dir=backups)) / (target.parent.name + '-skills')
-            target.rename(backup)
-        try:
-            target.symlink_to(source, target_is_directory=True)
-        except OSError:
-            if backup is not None:
-                backup.rename(target)
-            raise
-        if backup is not None:
-            print(f'Previous built-in skills preserved at {backup}.')
-    print('HUB Codex shares ~/.codex/skills; HUB Claude shares ~/.claude/skills, including future additions.')
-    print('Start a new T3 conversation to reload skills; refresh T3 if the skill picker is stale.')
-except (OSError, ValueError, RuntimeError) as error:
-    print(f'Skills setup failed: {error}', file=sys.stderr)
-    raise SystemExit(1)
-PY
-}
-
-configure_skills
-
-if [ -e "$HOME/.dittodub-provider-hub/codex/config.toml" ]; then
+if [ -e "$HOME/.dittodub-provider-hub/codex/config.toml" ] ||
+   [ -L "$HOME/.dittodub-provider-hub/codex/config.toml" ] ||
+   [ -e "$HOME/.dittodub-provider-hub/codex/hub-connection.json" ] ||
+   [ -e "$HOME/.dittodub-provider-hub/codex/auth.json" ] ||
+   [ -e "$HOME/.dittodub-provider-hub/device-key" ]; then
   configure_usage
   exit 0
 fi
@@ -170,7 +116,8 @@ if directory.stat().st_uid != os.getuid():
     print('The team hub directory has a different owner; no configuration was written.', file=sys.stderr)
     raise SystemExit(1)
 directory.chmod(0o700)
-target = directory / 'config.toml'
+target = directory / 'hub-connection.json'
+auth_file = directory / 'auth.json'
 claude_directory = root / 'claude'
 if claude_directory.is_symlink():
     print('The Claude hub directory is a symbolic link; no configuration was written.', file=sys.stderr)
@@ -182,21 +129,13 @@ if claude_directory.stat().st_uid != os.getuid():
 claude_directory.chmod(0o700)
 device_key = root / 'device-key'
 wrapper = root / 'hub-claude'
-for candidate in (target, device_key, wrapper):
+for candidate in (target, auth_file, device_key, wrapper):
     if candidate.exists() or candidate.is_symlink():
         print('A hub config already exists. No credentials were overwritten.', file=sys.stderr)
         raise SystemExit(1)
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
-content = f'''model_provider = "dittodub-provider-hub"
-
-[model_providers.dittodub-provider-hub]
-name = "Multi-Account Hub"
-base_url = "{HUB}/v1"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = true
-experimental_bearer_token = "{key}"
-'''
+content = json.dumps({'version': 1, 'baseUrl': HUB + '/v1'}) + '\n'
+auth = json.dumps({'OPENAI_API_KEY': key}) + '\n'
 launcher = f'''#!/bin/sh
 set -eu
 export ANTHROPIC_BASE_URL="{HUB}"
@@ -206,7 +145,7 @@ exec claude "$@"
 '''
 written = []
 try:
-    for destination, data, mode in ((target, content, 0o600), (device_key, key + '\n', 0o600), (wrapper, launcher, 0o700)):
+    for destination, data, mode in ((target, content, 0o600), (auth_file, auth, 0o600), (device_key, key + '\n', 0o600), (wrapper, launcher, 0o700)):
         descriptor = os.open(destination, flags, mode)
         written.append(destination)
         with os.fdopen(descriptor, 'w') as output:

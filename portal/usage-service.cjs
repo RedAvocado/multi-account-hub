@@ -63,6 +63,44 @@ function window(label, value, usedKey, resetKey, precise) {
   if (remaining === null) return null;
   return {label, remaining, resetsAt: timestamp(value[resetKey])};
 }
+const roundCredits = value => Math.round(value * 100) / 100;
+// Codex credits keep an account usable after its plan quota is used up. The
+// hub treats them as a fallback only; `usable` means the provider would accept
+// requests on credits right now.
+function parseCodexCredits(body) {
+  const value = body?.credits;
+  if (!value || typeof value !== 'object') return null;
+  const balance = Number(value.balance);
+  const unlimited = value.unlimited === true;
+  if (!unlimited && (!Number.isFinite(balance) || Math.abs(balance) > 1e12)) return null;
+  const blocked = value.overage_limit_reached === true || body?.spend_control?.reached === true;
+  const left = Number.isFinite(balance) ? Math.max(0, roundCredits(balance)) : null;
+  return {balance: left, unlimited, usable: !blocked && (unlimited || (value.has_credits === true && left > 0)), grants: []};
+}
+// Each promotional or purchased grant expires on its own date.
+function parseCreditGrants(body, at) {
+  const details = Array.isArray(body?.expiring_balance_details) ? body.expiring_balance_details.slice(0, 50) : [];
+  return details.flatMap(detail => {
+    const remaining = Number(detail?.amount_remaining), granted = Number(detail?.amount_granted);
+    const expiresAt = timestamp(detail?.expiry_date);
+    if (!Number.isFinite(remaining) || remaining <= 0 || remaining > 1e12 || !expiresAt || Date.parse(expiresAt) <= at) return [];
+    return [{remaining: roundCredits(remaining), granted: Number.isFinite(granted) && granted >= 0 && granted <= 1e12 ? roundCredits(granted) : null,
+      expiresAt, type: typeof detail.grant_type === 'string' && /^[a-z_]{1,40}$/.test(detail.grant_type) ? detail.grant_type : null}];
+  }).sort((left, right) => left.expiresAt.localeCompare(right.expiresAt)).slice(0, 20);
+}
+// Claude reports usage credits under `spend`. Extra usage is billed, so only a
+// prepaid balance on an enabled account could ever count as usable.
+function parseClaudeCredits(body) {
+  const spend = body?.spend;
+  if (!spend || typeof spend !== 'object') return null;
+  const money = value => value && typeof value === 'object' && Number.isSafeInteger(value.amount_minor) &&
+    Number.isInteger(value.exponent) && value.exponent >= 0 && value.exponent <= 6 ? value.amount_minor / 10 ** value.exponent : null;
+  const balance = money(spend.balance);
+  const currency = [spend.balance?.currency, spend.used?.currency].find(code => typeof code === 'string' && /^[A-Z]{3}$/.test(code)) || null;
+  const extraUsage = spend.enabled === true;
+  return {balance: balance !== null && balance >= 0 ? roundCredits(balance) : null, currency, extraUsage,
+    unlimited: false, usable: extraUsage && balance > 0, grants: []};
+}
 function parseCodex(body, {precise = false} = {}) {
   const periods = body?.rate_limit;
   const windows = [];
@@ -79,7 +117,7 @@ function parseCodex(body, {precise = false} = {}) {
     ? body.plan_type : null;
   const count = body?.rate_limit_reset_credits?.available_count;
   return {plan, windows, bankedResets: Number.isSafeInteger(count) && count >= 0 && count <= 1000 ? count : null,
-    resetExpirations: [], renewsAt: null};
+    resetExpirations: [], renewsAt: null, credits: parseCodexCredits(body)};
 }
 function parseClaude(body, {precise = false} = {}) {
   const windows = [];
@@ -101,7 +139,7 @@ function parseClaude(body, {precise = false} = {}) {
       const index = windows.findIndex(x => x.label === 'Fable'); if (index >= 0) windows[index] = entry; else windows.push(entry);
     }
   }
-  return {plan: null, windows, bankedResets: null, resetExpirations: [], renewsAt: null};
+  return {plan: null, windows, bankedResets: null, resetExpirations: [], renewsAt: null, credits: parseClaudeCredits(body)};
 }
 
 function claudePlan(profile) {
@@ -125,6 +163,7 @@ const accountId = account => crypto.createHash('sha256').update(JSON.stringify([
 function createUsage({admin, authDir, management = managementClient(authDir), now = Date.now, details = true, routingCredits = false, history}) {
   const cache = new Map();
   const creditCache = new Map();
+  const grantCache = new Map();
   const claudeProfiles = new Map();
   const pending = new Map();
   const generations = new Map();
@@ -207,12 +246,12 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
     }
     return null;
   }
-  const resetCredits = createResetCredits({resolve: resolveCodexAccount, management, now, invalidate(account) {
+  const resetCredits = createResetCredits({resolve: resolveCodexAccount, authorize: resetAuthorized, management, now, invalidate(account) {
     const key = usageKey(account);
     // Reset redemption invalidates this process's Codex observations. Shared
     // quota state is Claude-only, so deleting a file cannot cancel another
     // process's in-flight Codex read or make its local generation advance.
-    cache.delete(key); creditCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
+    cache.delete(key); creditCache.delete(key); grantCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
   }});
   let running = 0;
   const waiting = [];
@@ -230,6 +269,14 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
     const ids = new Set(users[0].accounts);
     return snapshot.accounts.filter(account => ids.has(account.id) && !account.disabled &&
       (!account.personal || account.owner === identity.name));
+  }
+  async function resetAuthorized(identity) {
+    const snapshot = await admin.snapshot();
+    const users = snapshot.users.filter(user => user.name === identity.name &&
+      user.email?.toLowerCase() === identity.email.toLowerCase() && user.enabled && user.editable);
+    if (users.length !== 1 || users[0].allowResets === false) {
+      throw new ResetError(403, 'Reset access is disabled for this member.');
+    }
   }
   async function upstream(index, url, header) {
     const result = await management('api-call', {auth_index: index, method: 'GET', url, header});
@@ -308,6 +355,21 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       return consistent(value) ? value : null; // Retain successful age without reusing uncertain expirations.
     }
   }
+  // Grant expirations change rarely; the balance itself comes with every usage read.
+  async function creditGrants(account, index, header) {
+    const key = usageKey(account), generation = generations.get(key) || 0, previous = grantCache.get(key);
+    if (previous && now() - previous.attemptedAt < (previous.failed ? RETRY_DELAY : CREDIT_MAX_AGE)) return previous.value;
+    try {
+      const body = await upstream(index, `https://chatgpt.com/backend-api/accounts/${encodeURIComponent(header['ChatGPT-Account-ID'])}/remaining_balance`, header);
+      const value = parseCreditGrants(body, now());
+      if ((generations.get(key) || 0) !== generation) return previous?.value || null;
+      grantCache.set(key, {value, attemptedAt: now(), failed: false});
+      return value;
+    } catch (_) {
+      if ((generations.get(key) || 0) === generation) grantCache.set(key, {value: previous?.value || null, attemptedAt: now(), failed: true});
+      return previous?.value || null;
+    }
+  }
   async function fetchClaudeQuota(account, files) {
     const key = usageKey(account);
     const latest = readShared(key);
@@ -364,6 +426,10 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       const checkedAt = now();
       const result = parseCodex(body, {precise: true});
       if (!result.windows.length) throw new Error('no usage data');
+      if (result.credits && (result.credits.unlimited || result.credits.balance > 0)) {
+        const grants = await creditGrants(account, index, header);
+        if (grants) result.credits.grants = grants;
+      }
       if (routingCredits) {
         const creditDetails = await routingCreditDetails(account, index, header, result.bankedResets);
         if (creditDetails) result.resetCredits = creditDetails;
@@ -486,6 +552,7 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       const status = values[index];
       return [{id: accountId(account), provider: account.provider, email: account.email, organization: account.organization, displayName: account.displayName || '',
         ...(status.value || {plan: null, windows: [], bankedResets: null, resetExpirations: [], renewsAt: null}),
+        credits: status.value?.credits || null,
         ...(account.provider === 'claude' && details ? {plan: claudeProfiles.get(usageKey(account))?.plan ?? status.value?.plan ?? null} : {}),
         windows: (status.value?.windows || []).map(({label,remaining,resetsAt}) => ({label,remaining: Math.round(remaining * 10) / 10,resetsAt})),
         ...(history ? {burnRates: history.get(account.id, account.provider)} : {}),
@@ -518,17 +585,21 @@ function createUsage({admin, authDir, management = managementClient(authDir), no
       const after = current.get(account.id), status = values[i];
       if (!after || after.provider !== account.provider || after.email !== account.email ||
           after.personal !== account.personal || after.owner !== account.owner || !status.value || !status.checkedAt) return [];
+      const credits = status.value.credits;
       return [[account.id, {provider: account.provider, checkedAt: new Date(status.checkedAt).toISOString(),
-        windows: status.value.windows, ...(status.value.resetCredits ? {resetCredits: status.value.resetCredits} : {})}]];
+        windows: status.value.windows, ...(status.value.resetCredits ? {resetCredits: status.value.resetCredits} : {}),
+        // The router may fall back to usable credits once every plan is used up.
+        ...(credits ? {credits: {usable: credits.usable === true, balance: credits.balance, unlimited: credits.unlimited === true,
+          expiresAt: credits.grants?.[0]?.expiresAt || null}} : {})}]];
     }))};
   }
   function invalidateAccount(id) {
     for (const key of new Set([...cache.keys(), ...creditCache.keys(), ...pending.keys(), ...generations.keys()])) {
       if (JSON.parse(key)[0] !== id) continue;
-      cache.delete(key); creditCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
+      cache.delete(key); creditCache.delete(key); grantCache.delete(key); generations.set(key, (generations.get(key) || 0) + 1);
     }
   }
   return {getForUser, listForUser, resetCredits, getForRouting, invalidateAccount};
 }
 
-module.exports = {createUsage, parseCodex, parseClaude, claudePlan, managementClient};
+module.exports = {createUsage, parseCodex, parseClaude, parseCreditGrants, claudePlan, managementClient};

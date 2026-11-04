@@ -1,5 +1,7 @@
 """Exercise the served installer with isolated homes and stubbed usage/network."""
 import os
+import shutil
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -17,14 +19,26 @@ class SetupSkillsTest(unittest.TestCase):
         self.hub = self.home / '.dittodub-provider-hub'
         (self.hub / 'codex').mkdir(parents=True)
         self.config = self.hub / 'codex/config.toml'
-        self.config.write_text('existing configuration must remain unchanged\n')
+        self.config.write_text('model_provider = "hub"\n[model_providers.hub]\nbase_url = "https://hub.example.com/v1"\nexperimental_bearer_token = "' + 'h' * 43 + '"\n')
+        self.config.chmod(0o600)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        # Never contact the real hub or T3. The skills code still uses Python.
-        for name in ('curl', 'node'):
-            stub = self.bin / name
-            stub.write_text('#!/bin/sh\nexit 0\n')
-            stub.chmod(0o700)
+        # Exercise the real environment helper; never contact the hub or T3.
+        helper = self.home / 'helper.cjs'
+        helper.write_text((SCRIPT.parent.parent / 'scripts/configure-t3-usage.cjs').read_text().replace('__HUB_ORIGIN__', 'https://hub.example.com'))
+        curl = self.bin / 'curl'
+        curl.write_text('#!/bin/sh\nfor arg; do destination="$arg"; done\ncp "$HOME/helper.cjs" "$destination"\n')
+        curl.chmod(0o700)
+        node = self.bin / 'node'
+        node.write_text(f'''#!{sys.executable}
+import sys,subprocess
+if sys.argv[2] == '--check': sys.exit(0)
+if sys.argv[2] == '--check-environment':
+    sys.exit(subprocess.run([{shutil.which('node')!r}, sys.argv[1], '--check-environment']).returncode)
+assert sys.argv[2] == '--codex-home'
+sys.exit(subprocess.run([{shutil.which('node')!r}, '-e', "require(process.argv[1]).environmentPlan(require('os').homedir()).apply()", sys.argv[1]]).returncode)
+''')
+        node.chmod(0o700)
 
     def run_setup(self, success=True):
         before = self.config.read_bytes() if self.config.exists() else None
@@ -38,7 +52,7 @@ class SetupSkillsTest(unittest.TestCase):
             self.assertNotIn('Paste', result.stdout)
         else:
             self.assertNotEqual(result.returncode, 0)
-        if before is not None:
+        if before is not None and not success:
             self.assertEqual(self.config.read_bytes(), before)
         self.assertNotIn('unused-setup-code', result.stdout + result.stderr)
         return result
@@ -58,7 +72,7 @@ class SetupSkillsTest(unittest.TestCase):
             (source / 'later').mkdir()
             (source / 'later/SKILL.md').write_text('later skill')
             self.assertTrue((target / 'later/SKILL.md').samefile(source / 'later/SKILL.md'))
-        self.assertFalse((self.hub / 'backups').exists())
+        self.assertEqual(len(list((self.hub / 'backups').iterdir())), 1)
 
     def test_missing_sources_are_created(self):
         self.run_setup()
@@ -95,12 +109,12 @@ class SetupSkillsTest(unittest.TestCase):
         self.assertIn('already links elsewhere', result.stderr)
         self.assertTrue(target.samefile(other))
 
-    def test_fresh_install_links_before_reading_code(self):
+    def test_fresh_install_preflights_before_reading_code(self):
         self.config.unlink()
         result = self.run_setup(success=False)
         self.assertIn('Invalid setup code', result.stderr)
-        self.assertTrue((self.hub / 'codex/skills').is_symlink())
-        self.assertTrue((self.hub / 'claude/skills').is_symlink())
+        self.assertFalse((self.hub / 'codex/skills').exists())
+        self.assertFalse((self.hub / 'claude/skills').exists())
         self.assertFalse(self.config.exists())
 
     def test_source_pointing_back_into_hub_is_rejected(self):
@@ -110,7 +124,7 @@ class SetupSkillsTest(unittest.TestCase):
         target.mkdir()
         source.symlink_to(target)
         result = self.run_setup(success=False)
-        self.assertIn('points inside the hub home', result.stderr)
+        self.assertIn('without symbolic links', result.stderr)
         self.assertFalse(target.is_symlink())
 
 

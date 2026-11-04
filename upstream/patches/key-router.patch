@@ -11,7 +11,7 @@ index 2e159d4..22b997e 100644
  require (
  	github.com/router-for-me/CLIProxyAPI/v8 v8.0.0
 diff --git a/main.go b/main.go
-index 3a3a1b3..cd4378a 100644
+index 3a3a1b3..329377d 100644
 --- a/main.go
 +++ b/main.go
 @@ -50,7 +50,9 @@ import (
@@ -29,7 +29,7 @@ index 3a3a1b3..cd4378a 100644
  )
  
 -const pluginVersion = "0.5.0"
-+const pluginVersion = "0.6.2"
++const pluginVersion = "0.7.0"
  
  // configUIPath is the resource path shown as a menu page in the management panel,
  // served at /v0/resource/plugins/key-router/config.
@@ -123,7 +123,7 @@ index 3a3a1b3..cd4378a 100644
  				{
  					Name:        "users",
  					Type:        pluginapi.ConfigFieldTypeArray,
-@@ -317,17 +340,22 @@ func pickAuth(raw []byte) ([]byte, error) {
+@@ -317,36 +340,50 @@ func pickAuth(raw []byte) ([]byte, error) {
  	}
  	table := loadedConfig()
  	if table == nil || len(table.byKey) == 0 {
@@ -138,31 +138,49 @@ index 3a3a1b3..cd4378a 100644
 +		return rejectSelection("caller has no assigned account permissions")
  	}
  
- 	var primary, access []pluginapi.SchedulerAuthCandidate
+-	var primary, access []pluginapi.SchedulerAuthCandidate
++	var primary, access, creditPrimary, creditAccess []pluginapi.SchedulerAuthCandidate
 +	now := time.Now()
 +	quotas := readQuotaSnapshot(table.usageFile, now)
 +	req.Model = canonicalModel(req.Model)
  	for _, candidate := range req.Candidates {
+-		switch table.tier(user, candidate) {
++		tier := table.tier(user, candidate)
 +		if remaining, known := quotaHeadroom(candidate, req.Model, quotas, now); known && remaining == 0 {
++			// A used-up plan stays out unless its credits are needed below.
++			if creditsUsable(candidate, quotas, now) {
++				switch tier {
++				case tierPrimary:
++					creditPrimary = append(creditPrimary, candidate)
++				case tierAccess:
++					creditAccess = append(creditAccess, candidate)
++				}
++			}
 +			continue
 +		}
- 		switch table.tier(user, candidate) {
++		switch tier {
  		case tierPrimary:
  			primary = append(primary, candidate)
-@@ -335,18 +363,10 @@ func pickAuth(raw []byte) ([]byte, error) {
+ 		case tierAccess:
  			access = append(access, candidate)
  		}
  	}
 -	if pick, ok := best(primary); ok {
 -		logf(table, "user=%s model=%s: primary %s", user.Name, req.Model, pick)
+-		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
++	// Credits are a fallback only: they are spent once every permitted plan
++	// for this request is used up, and sessions return to plan quota as soon
++	// as any plan has headroom again.
++	if len(primary) == 0 && len(access) == 0 && (len(creditPrimary) > 0 || len(creditAccess) > 0) {
++		primary, access = creditPrimary, creditAccess
++		logf(table, "user=%s model=%s: every plan is used up, falling back to credits", user.Name, req.Model)
+ 	}
+-	if pick, ok := best(access); ok {
+-		logf(table, "user=%s model=%s: no primary available, access %s", user.Name, req.Model, pick)
 +	if pick, ok := bestForSession(user, req, primary, access, quotas, now); ok {
 +		logf(table, "user=%s model=%s: selected %s", user.Name, req.Model, pick)
  		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
  	}
--	if pick, ok := best(access); ok {
--		logf(table, "user=%s model=%s: no primary available, access %s", user.Name, req.Model, pick)
--		return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: pick, Handled: true})
--	}
 -	if table.rules[user].unrestricted {
 -		logf(table, "user=%s model=%s: no own account available, built-in routing over %d candidate(s)", user.Name, req.Model, len(req.Candidates))
 -		return unhandled()
@@ -170,7 +188,7 @@ index 3a3a1b3..cd4378a 100644
  	logf(table, "user=%s model=%s: rejected, none of %d candidate(s) is allowed", user.Name, req.Model, len(req.Candidates))
  	return okEnvelope(pluginapi.SchedulerPickResponse{
  		Handled:      true,
-@@ -356,18 +376,114 @@ func pickAuth(raw []byte) ([]byte, error) {
+@@ -356,18 +393,114 @@ func pickAuth(raw []byte) ([]byte, error) {
  	})
  }
  
@@ -289,7 +307,7 @@ index 3a3a1b3..cd4378a 100644
  }
  
  // tier classifies an account for a user; primary wins over access.
-@@ -388,6 +504,12 @@ func matchesAny(rules []string, candidate pluginapi.SchedulerAuthCandidate) bool
+@@ -388,6 +521,12 @@ func matchesAny(rules []string, candidate pluginapi.SchedulerAuthCandidate) bool
  	note := strings.ToLower(candidate.Attributes["note"])
  	provider := strings.ToLower(candidate.Provider)
  	for _, rule := range rules {
@@ -302,7 +320,7 @@ index 3a3a1b3..cd4378a 100644
  		if ruleProvider, identity, scoped := strings.Cut(rule, ":"); scoped {
  			if ruleProvider == provider && containsToken(id, identity) {
  				return true
-@@ -429,9 +551,7 @@ func isIdentityChar(c byte) bool {
+@@ -429,9 +568,7 @@ func isIdentityChar(c byte) bool {
  // ?key=). Request headers are a fallback for hosts without caller_scope.
  func (t *routingTable) userFor(opts pluginapi.SchedulerOptions) *userConfig {
  	if scope, _ := opts.Metadata["caller_scope"].(string); scope != "" {
@@ -313,7 +331,7 @@ index 3a3a1b3..cd4378a 100644
  	}
  	get := func(name string) string {
  		for key, values := range opts.Headers {
-@@ -480,8 +600,9 @@ func handleManagement(raw []byte) ([]byte, error) {
+@@ -480,8 +617,9 @@ func handleManagement(raw []byte) ([]byte, error) {
  	})
  }
  
@@ -327,10 +345,10 @@ index 3a3a1b3..cd4378a 100644
  func loadedConfig() *routingTable {
 diff --git a/quota.go b/quota.go
 new file mode 100644
-index 0000000..61aad7d
+index 0000000..036e075
 --- /dev/null
 +++ b/quota.go
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,299 @@
 +package main
 +
 +import (
@@ -395,6 +413,22 @@ index 0000000..61aad7d
 +	CheckedAt    time.Time     `json:"checkedAt"`
 +	Windows      []quotaWindow `json:"windows"`
 +	ResetCredits *resetCredits `json:"resetCredits,omitempty"`
++	Credits      *usageCredits `json:"credits,omitempty"`
++}
++
++// usageCredits are provider credits that keep an account usable after its
++// plan quota is used up, such as Codex promotional or purchased credits.
++type usageCredits struct {
++	Usable bool `json:"usable"`
++}
++
++// creditsUsable reports whether a fresh observation says the provider accepts
++// requests on this account's credits. Missing or stale data never spends them.
++func creditsUsable(candidate pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, now time.Time) bool {
++	quota, ok := snapshot.Accounts[candidate.ID]
++	return ok && quota.Provider == candidate.Provider && !quota.CheckedAt.IsZero() &&
++		now.Sub(quota.CheckedAt) <= quotaMaxAge && !quota.CheckedAt.After(now.Add(5*time.Second)) &&
++		quota.Credits != nil && quota.Credits.Usable
 +}
 +
 +type resetCredits struct {
@@ -616,10 +650,10 @@ index 0000000..61aad7d
 +}
 diff --git a/quota_test.go b/quota_test.go
 new file mode 100644
-index 0000000..0bbb556
+index 0000000..205f7df
 --- /dev/null
 +++ b/quota_test.go
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,514 @@
 +package main
 +
 +import (
@@ -1067,6 +1101,71 @@ index 0000000..0bbb556
 +	claudeSnapshot.Accounts[pinned] = accountQuota{Provider: "claude", CheckedAt: now, Windows: window(1, 70)}
 +	if got, _ := bestForSession(user, claudeReq, claude, nil, claudeSnapshot, now); got != spare {
 +		t.Fatalf("Claude session stayed on an account with an exhausted 5h window, got %s", got)
++	}
++}
++
++func TestCreditsAreFallbackOnlyAfterEveryPlanIsUsedUp(t *testing.T) {
++	file := filepath.Join(t.TempDir(), "routing-usage.json")
++	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("usage-file: " + file + "\nusers:\n  - {name: credit-fallback, api-keys: [k], primary: [id=plan, id=credit-a], access: [id=credit-b]}\n")})
++	if err := configure(raw); err != nil {
++		t.Fatal(err)
++	}
++	plan := pluginapi.SchedulerAuthCandidate{ID: "plan", Provider: "codex"}
++	creditA := pluginapi.SchedulerAuthCandidate{ID: "credit-a", Provider: "codex"}
++	creditB := pluginapi.SchedulerAuthCandidate{ID: "credit-b", Provider: "codex"}
++	foreign := pluginapi.SchedulerAuthCandidate{ID: "not-permitted", Provider: "codex"}
++	opts := scope("k")
++	opts.Headers = map[string][]string{"Session-Id": {"credit-session"}}
++	type state struct {
++		remaining float64
++		credits   *usageCredits
++	}
++	write := func(states map[string]state) {
++		t.Helper()
++		accounts := map[string]accountQuota{}
++		for id, s := range states {
++			remaining := s.remaining
++			accounts[id] = accountQuota{Provider: "codex", CheckedAt: time.Now(), Windows: []quotaWindow{{Label: "1w", Remaining: &remaining}}, Credits: s.credits}
++		}
++		encoded, _ := json.Marshal(quotaSnapshot{Version: 1, Accounts: accounts})
++		if err := os.WriteFile(file, encoded, 0600); err != nil {
++			t.Fatal(err)
++		}
++		quotaCache.Lock()
++		quotaCache.readAt = time.Time{}
++		quotaCache.Unlock()
++	}
++	usable := &usageCredits{Usable: true}
++	all := []pluginapi.SchedulerAuthCandidate{foreign, plan, creditA, creditB}
++
++	// Any plan quota left: credits are never chosen, even for a new session.
++	write(map[string]state{"plan": {remaining: 1}, "credit-a": {remaining: 0, credits: usable}, "credit-b": {remaining: 0, credits: usable}, "not-permitted": {remaining: 100}})
++	if got := pick(t, opts, all...); got.AuthID != plan.ID {
++		t.Fatalf("plan quota must be used before credits: %+v", got)
++	}
++	// Every plan used up: fall back to credits, primary tier first.
++	write(map[string]state{"plan": {remaining: 0}, "credit-a": {remaining: 0, credits: usable}, "credit-b": {remaining: 0, credits: usable}, "not-permitted": {remaining: 100, credits: usable}})
++	if got := pick(t, opts, all...); got.AuthID != creditA.ID || got.Reject {
++		t.Fatalf("expected primary credit fallback, got %+v", got)
++	}
++	// Access-tier credits are used when no primary account has credits.
++	write(map[string]state{"plan": {remaining: 0}, "credit-a": {remaining: 0, credits: &usageCredits{Usable: false}}, "credit-b": {remaining: 0, credits: usable}})
++	if got := pick(t, opts, all...); got.AuthID != creditB.ID || got.Reject {
++		t.Fatalf("expected access credit fallback, got %+v", got)
++	}
++	// A plan with headroom again pulls the session back off credits at once.
++	write(map[string]state{"plan": {remaining: 40}, "credit-a": {remaining: 0, credits: usable}, "credit-b": {remaining: 0, credits: usable}})
++	if got := pick(t, opts, all...); got.AuthID != plan.ID {
++		t.Fatalf("session must leave credits once a plan recovers: %+v", got)
++	}
++	// Credits the provider would not accept (empty, capped) never count.
++	write(map[string]state{"plan": {remaining: 0}, "credit-a": {remaining: 0, credits: &usageCredits{Usable: false}}, "credit-b": {remaining: 0}})
++	if got := pick(t, opts, all...); !got.Reject {
++		t.Fatalf("unusable credits must not be chosen: %+v", got)
++	}
++	write(map[string]state{"plan": {remaining: 0}, "credit-a": {remaining: 0}, "credit-b": {remaining: 0}, "not-permitted": {remaining: 0, credits: usable}})
++	if got := pick(t, opts, all...); !got.Reject {
++		t.Fatalf("another member's credits must never be used: %+v", got)
 +	}
 +}
 diff --git a/router_test.go b/router_test.go

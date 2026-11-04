@@ -36,7 +36,28 @@ function portalSettings(raw, origins) {
   }
   const credentials = raw.googleCredentialsFile ?? '~/.config/multi-account-hub/google-oauth.env';
   if (typeof credentials !== 'string' || !credentials) throw new Error('hub.json: portal.googleCredentialsFile must be a path');
-  return Object.freeze({workspaceDomain, googleRedirectUri, googleCredentialsFile: path.resolve(expandHome(credentials))});
+  // The website answers on the hub URL and on each additional site, every
+  // one with its own Google redirect so sign-in stays on that address.
+  const extra = raw.additionalSites ?? [];
+  if (!Array.isArray(extra) || extra.length > 10) throw new Error('hub.json: portal.additionalSites must be a list');
+  const sites = [{origin: origins[0], googleRedirectUri}];
+  for (const [index, entry] of extra.entries()) {
+    const field = `portal.additionalSites[${index}]`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`hub.json: ${field} must be an object`);
+    const siteOrigin = origin(entry.url, `${field}.url`);
+    if (!origins.includes(siteOrigin) || sites.some(site => site.origin === siteOrigin)) {
+      throw new Error(`hub.json: ${field}.url must be listed in alternateUrls and appear only once`);
+    }
+    const siteRedirect = entry.googleRedirectUri ?? siteOrigin + '/oauth/callback';
+    let parsed;
+    try { parsed = new URL(siteRedirect); } catch (_) { parsed = null; }
+    if (!parsed || !origins.includes(parsed.origin) || parsed.search || parsed.hash) {
+      throw new Error(`hub.json: ${field}.googleRedirectUri must be on the hub URL or an alternate URL`);
+    }
+    sites.push({origin: siteOrigin, googleRedirectUri: siteRedirect});
+  }
+  return Object.freeze({workspaceDomain, googleRedirectUri, sites: Object.freeze(sites.map(Object.freeze)),
+    googleCredentialsFile: path.resolve(expandHome(credentials))});
 }
 
 function loadHubConfig(directory) {

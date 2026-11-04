@@ -35,7 +35,7 @@ function redemptionId(context, credit) {
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
 }
 
-function createResetCredits({resolve, management, invalidate, now = Date.now}) {
+function createResetCredits({resolve, authorize = async () => {}, management, invalidate, now = Date.now}) {
   const cache = new Map(), pending = new Map(), generations = new Map(), consuming = new Set(), receipts = new Map();
   async function call(context, url, data) {
     const response = await management('api-call', {auth_index: context.index, method: data ? 'POST' : 'GET', url,
@@ -72,6 +72,7 @@ function createResetCredits({resolve, management, invalidate, now = Date.now}) {
   }
   async function current(identity, id, context, stillAuthorized) {
     if (!stillAuthorized()) throw new ResetError(401, 'Unauthorized');
+    await authorize(identity);
     const next = await resolve(identity, id);
     if (!stillAuthorized() || (context && !sameContext(context, next))) throw new ResetError(403, 'Account access changed.');
     return next;
@@ -108,6 +109,7 @@ function createResetCredits({resolve, management, invalidate, now = Date.now}) {
     } finally { expire(context); consuming.delete(key); }
   }
   async function clearCooldown(identity, id, stillAuthorized) {
+    await authorize(identity);
     cleanReceipts();
     const receipt = receipts.get(receiptKey(identity, id));
     if (!receipt) throw new ResetError(409, 'A successful reset is required before clearing cooldown.');

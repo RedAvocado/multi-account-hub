@@ -6,6 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const {execFileSync} = require('node:child_process');
 // The hub fills in its own addresses when it serves this script.
 const HUB_ORIGINS = ['__HUB_ORIGIN__', /* __HUB_ALTERNATE_ORIGINS__ */];
@@ -19,25 +20,232 @@ function option(args, name) {
   return path.resolve(args[i + 1]);
 }
 function readPrivate(file) {
+  // Inspect and open without following a symlink; recheck the open inode so
+  // a rename between preflight and read cannot redirect a credential read.
   const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) || stat.size > 1024 * 1024) {
-    throw new SetupError(`Expected a private, owned regular file: ${file}`);
-  }
-  return fs.readFileSync(file, 'utf8');
+  const valid = value => value.isFile() && value.uid === process.getuid() &&
+    !(value.mode & 0o077) && value.nlink === 1 && value.size <= 1024 * 1024;
+  if (!valid(stat)) throw new SetupError('Expected a private, owned regular file: ' + file);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!valid(opened) || opened.ino !== stat.ino || opened.dev !== stat.dev) {
+      throw new SetupError('Private HUB file changed during setup; retry.');
+    }
+    return fs.readFileSync(fd, 'utf8');
+  } finally { fs.closeSync(fd); }
 }
-function parseConfig(text, origins = HUB_ORIGINS) {
-  const name = /^model_provider\s*=\s*"([a-zA-Z0-9_-]+)"\s*$/m.exec(text)?.[1];
-  if (!name) throw new SetupError('Could not find the selected hub provider.');
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const block = new RegExp(`^\\[model_providers\\.${escaped}\\]\\s*\n([^]*?)(?=^\\[|(?![^]))`, 'm').exec(text);
+function lstat(file) {
+  try { return fs.lstatSync(file); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+function ownedDirectory(directory) {
+  const stat = lstat(directory);
+  if (stat && (!stat.isDirectory() || stat.uid !== process.getuid())) {
+    throw new SetupError('Expected an owned directory, without symbolic links: ' + directory);
+  }
+}
+function optionalPrivate(file) { return lstat(file) ? readPrivate(file) : undefined; }
+function privateAuth(codexHome) {
+  const text = optionalPrivate(path.join(codexHome, 'auth.json'));
+  if (text === undefined) return undefined;
+  let auth;
+  try { auth = JSON.parse(text); } catch (_) { throw new SetupError('Invalid private HUB auth.json; it was preserved.'); }
+  if (!/^[A-Za-z0-9_-]{40,128}$/.test(auth?.OPENAI_API_KEY || '') || auth.tokens) {
+    throw new SetupError('Existing Codex authentication differs; it was preserved.');
+  }
+  return auth.OPENAI_API_KEY;
+}
+function recognizedBase(base, origins) {
+  return [ 'http://127.0.0.1:8317/v1', ...origins.map(origin => origin + '/v1') ].includes(base);
+}
+function parseConfig(text, origins = HUB_ORIGINS, minimal = false) {
+  // Read only the old installer format. Never evaluate TOML or include its
+  // contents in errors: the old config contains a bearer credential.
+  const top = text.split(/^\s*\[/m)[0];
+  const name = /^model_provider\s*=\s*"([a-zA-Z0-9_-]+)"\s*$/m.exec(top)?.[1];
+  if (!name) throw new SetupError('Could not find the selected hub provider. Preserve custom HUB settings in PERSONAL config or T3 launch arguments, then move the old config aside and rerun.');
+  const block = new RegExp('^\\[model_providers\\.' + name + '\\]\\s*\\n([^]*?)(?=^\\[|(?![^]))', 'm').exec(text);
   if (!block) throw new SetupError('Could not read the hub provider configuration.');
-  const base = /^base_url\s*=\s*"([^"]+)"\s*$/m.exec(block[1])?.[1];
+  const baseUrl = /^base_url\s*=\s*"([^"]+)"\s*$/m.exec(block[1])?.[1];
   const key = /^experimental_bearer_token\s*=\s*"([A-Za-z0-9_-]{40,128})"\s*$/m.exec(block[1])?.[1];
-  if (!key || !['http://127.0.0.1:8317/v1', ...origins.map(origin => origin + '/v1')].includes(base)) throw new SetupError('This is not a recognized hub connection.');
-  const updated = /^requires_openai_auth\s*=.*$/m.test(block[1])
-    ? block[1].replace(/^requires_openai_auth\s*=.*$/m, 'requires_openai_auth = true')
-    : block[1] + '\nrequires_openai_auth = true\n';
-  return {key, text: text.replace(block[0], block[0].replace(block[1], updated))};
+  if (!key || !recognizedBase(baseUrl, origins)) throw new SetupError('This is not a recognized hub connection.');
+  if (minimal) {
+    let section = '', seen = new Set();
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      if (line === '[model_providers.' + name + ']' && !section) { section = name; continue; }
+      const pair = /^([a-z_]+)\s*=\s*(.*)$/.exec(line);
+      const allowed = section
+        ? {name: /^"[^"\\]*"$/, base_url: /^"[^"\\]*"$/, wire_api: /^"responses"$/,
+          requires_openai_auth: /^(true|false)$/, supports_websockets: /^true$/,
+          experimental_bearer_token: /^"[A-Za-z0-9_-]{40,128}"$/}
+        : {model_provider: /^"[a-zA-Z0-9_-]+"$/};
+      const id = section + '.' + pair?.[1];
+      if (!pair || !allowed[pair[1]]?.test(pair[2]) || seen.has(id)) {
+        throw new SetupError('Custom HUB config.toml settings need a deliberate merge into ~/.codex/config.toml or T3 launch arguments. No config was replaced. Preserve those settings, then move the old config aside and rerun.');
+      }
+      seen.add(id);
+    }
+  }
+  return {key, baseUrl};
+}
+function readConnection(codexHome, {home, origins = HUB_ORIGINS, minimal = false} = {}) {
+  ownedDirectory(codexHome);
+  const standard = codexHome === path.join(home, '.dittodub-provider-hub/codex');
+  if (standard) ownedDirectory(path.dirname(codexHome));
+  const config = path.join(codexHome, 'config.toml'), stat = lstat(config);
+  let old;
+  if (stat?.isSymbolicLink()) {
+    const source = path.join(home, '.codex/config.toml');
+    ownedDirectory(path.dirname(source));
+    if (!standard || stat.uid !== process.getuid() ||
+        path.resolve(path.dirname(config), fs.readlinkSync(config)) !== source || lstat(source)?.isSymbolicLink()) {
+      throw new SetupError('Unexpected HUB config.toml link; only the owned link to ~/.codex/config.toml is supported.');
+    }
+  } else if (stat) old = parseConfig(readPrivate(config), origins, minimal);
+  const saved = optionalPrivate(path.join(codexHome, 'hub-connection.json'));
+  let metadata;
+  if (saved !== undefined) {
+    try { metadata = JSON.parse(saved); } catch (_) { throw new SetupError('Invalid private HUB connection metadata.'); }
+    if (metadata?.version !== 1 || !recognizedBase(metadata.baseUrl, origins)) throw new SetupError('Unrecognized private HUB connection metadata.');
+  }
+  const auth = privateAuth(codexHome);
+  const device = standard ? optionalPrivate(path.join(path.dirname(codexHome), 'device-key'))?.trim() : undefined;
+  const keys = [old?.key, auth, device].filter(key => key !== undefined);
+  if (keys.some(key => !/^[A-Za-z0-9_-]{40,128}$/.test(key)) || new Set(keys).size > 1) {
+    throw new SetupError('HUB credentials disagree; all files were preserved. Reconcile auth.json, device-key, and the old HUB config before rerunning.');
+  }
+  if (!keys.length) {
+    if (metadata || stat) throw new SetupError('No private HUB credential found. Restore HUB auth.json or device-key before rerunning.');
+    return null;
+  }
+  return {key: keys[0], baseUrl: metadata?.baseUrl || old?.baseUrl || origins[0] + '/v1'};
+}
+function saveConnection(codexHome, connection) {
+  ownedDirectory(codexHome);
+  fs.mkdirSync(codexHome, {recursive: true, mode: 0o700});
+  if (!lstat(path.join(codexHome, 'auth.json'))) {
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({OPENAI_API_KEY: connection.key}) + '\n', {mode: 0o600, flag: 'wx'});
+  } else if (privateAuth(codexHome) !== connection.key) throw new SetupError('HUB auth changed during setup; retry.');
+  const file = path.join(codexHome, 'hub-connection.json');
+  if (!lstat(file)) fs.writeFileSync(file, JSON.stringify({version: 1, baseUrl: connection.baseUrl}) + '\n', {mode: 0o600, flag: 'wx'});
+}
+
+function saveClaudeCompanion(root, connection) {
+  const directory = path.join(root, 'claude'), device = path.join(root, 'device-key'), wrapper = path.join(root, 'hub-claude');
+  ownedDirectory(root); ownedDirectory(directory);
+  fs.mkdirSync(directory, {recursive: true, mode: 0o700});
+  if (!lstat(device)) fs.writeFileSync(device, connection.key + '\n', {mode: 0o600, flag: 'wx'});
+  if (!lstat(wrapper)) {
+    const origin = new URL(connection.baseUrl).origin;
+    fs.writeFileSync(wrapper, '#!/bin/sh\nset -eu\nexport ANTHROPIC_BASE_URL=' + JSON.stringify(origin) + '\n' +
+      'export ANTHROPIC_AUTH_TOKEN="$(cat "$HOME/.dittodub-provider-hub/device-key")"\n' +
+      'unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY\n' +
+      'exec claude "$@"\n', {mode: 0o700, flag: 'wx'});
+  }
+}
+
+// A plan is validated before enrollment/network/T3 mutations. Applying it
+// revalidates after provider launch arguments are saved, before discovery.
+function environmentPlan(home, origins = HUB_ORIGINS) {
+  const root = path.join(home, '.dittodub-provider-hub'), codexHome = path.join(root, 'codex');
+  for (const dir of [root, codexHome, path.join(root, 'claude'), path.join(root, 'backups'),
+    path.join(home, '.codex'), path.join(home, '.claude')]) ownedDirectory(dir);
+  const wrapper = lstat(path.join(root, 'hub-claude'));
+  if (wrapper && (!wrapper.isFile() || wrapper.uid !== process.getuid() || !(wrapper.mode & 0o100))) {
+    throw new SetupError('Expected an owned executable HUB Claude launcher, without symbolic links.');
+  }
+  const entries = [
+    ['codex', 'config.toml', false], ['codex', 'skills', true], ['codex', 'plugins', true],
+    ['codex', 'AGENTS.md', false], ['claude', 'skills', true],
+  ].map(([provider, name, directory]) => ({provider, name, directory,
+    source: path.join(home, '.' + provider, name), target: path.join(root, provider, name)}));
+  for (const entry of entries) {
+    const {source, target, directory, name} = entry;
+    const sourceStat = lstat(source), targetStat = lstat(target);
+    if (sourceStat && (sourceStat.uid !== process.getuid() ||
+        !(directory ? sourceStat.isDirectory() : sourceStat.isFile()))) {
+      throw new SetupError('Expected an owned PERSONAL file/folder without symbolic links: ' + source);
+    }
+    if (name === 'config.toml' && sourceStat && fs.readFileSync(source, 'utf8').includes(providerName(codexHome))) {
+      throw new SetupError('PERSONAL config contains the reserved HUB provider identifier. Remove that conflicting provider definition before rerunning; the file was preserved.');
+    }
+    if (targetStat?.isSymbolicLink()) {
+      if (targetStat.uid !== process.getuid() || path.resolve(path.dirname(target), fs.readlinkSync(target)) !== source) {
+        throw new SetupError(target + ' already links elsewhere. Preserve and resolve that link before rerunning.');
+      }
+      continue;
+    }
+    if (!targetStat) continue;
+    if (targetStat.uid !== process.getuid() || !(directory ? targetStat.isDirectory() : targetStat.isFile())) {
+      throw new SetupError('Unsafe existing HUB path: ' + target);
+    }
+    if (name === 'config.toml') continue; // Strict old-config check below.
+    const harmless = directory
+      ? fs.readdirSync(target).every(name => entry.name === 'skills' && name === '.system')
+      : targetStat.size === 0 || (sourceStat && fs.readFileSync(target).equals(fs.readFileSync(source)));
+    if (!harmless) throw new SetupError(target + ' contains custom files. Merge those ' + name + ' settings/files into ' + source + ', then move the old path aside and rerun. Nothing was hidden.');
+  }
+  const connection = readConnection(codexHome, {home, origins, minimal: true});
+  return {connection, apply() {
+    const fresh = environmentPlan(home, origins);
+    if (JSON.stringify(fresh.connection) !== JSON.stringify(connection)) throw new SetupError('HUB connection changed during setup; retry.');
+    if (!connection) throw new SetupError('Set up your hub connection first.');
+    saveConnection(codexHome, connection);
+    saveClaudeCompanion(root, connection);
+    for (const {source, target, directory, provider, name} of entries) {
+      fs.mkdirSync(path.dirname(source), {recursive: true, mode: 0o700});
+      fs.mkdirSync(path.dirname(target), {recursive: true, mode: 0o700});
+      if (!lstat(source)) {
+        if (directory) fs.mkdirSync(source, {mode: 0o700});
+        else fs.writeFileSync(source, '', {mode: 0o600, flag: 'wx'});
+      }
+      if (lstat(target)?.isSymbolicLink()) continue;
+      let backup;
+      if (lstat(target)) {
+        const backups = path.join(root, 'backups');
+        fs.mkdirSync(backups, {mode: 0o700, recursive: true});
+        backup = path.join(fs.mkdtempSync(path.join(backups, 'environment-')), provider + '-' + name);
+        fs.renameSync(target, backup);
+      }
+      try { fs.symlinkSync(source, target, directory ? 'dir' : 'file'); }
+      catch (error) { if (backup) fs.renameSync(backup, target); throw error; }
+      if (backup) console.log('Previous HUB file/folder preserved at ' + backup);
+    }
+  }};
+}
+
+function providerName(codexHome) {
+  // Codex merges CLI tables with config.toml (it does not replace them).
+  // A stable, installation-specific namespace avoids inheriting credentials
+  // or headers from any normal PERSONAL/old HUB provider definition.
+  return 'dittodub-provider-hub-' + crypto.createHash('sha256').update(path.resolve(codexHome)).digest('hex').slice(0, 16);
+}
+function routingArgs(baseUrl, codexHome) {
+  const name = providerName(codexHome);
+  return '-c \'model_provider="' + name + '"\' -c \'model_providers.' + name + '={name="Multi-Account Hub",base_url=' +
+    JSON.stringify(baseUrl) + ',wire_api="responses",requires_openai_auth=true,supports_websockets=true}\' ' +
+    '-c \'cli_auth_credentials_store="file"\' -c \'forced_login_method="api"\'';
+}
+function withRoutingArgs(current = '', baseUrl, codexHome) {
+  if (typeof current !== 'string') throw new SetupError('Unexpected Codex launch arguments; they were preserved.');
+  // Keep arbitrary user arguments byte-for-byte. Reuse our exact trailing
+  // suffix on reruns. Refuse a malformed quote or "--" which could swallow it.
+  let quote = '', escaped = false, token = '';
+  for (const char of current) {
+    if (escaped) { escaped = false; token += char; continue; }
+    if (char === '\\' && quote !== "'") { escaped = true; continue; }
+    if (quote) { if (char === quote) quote = ''; else token += char; continue; }
+    if (char === '"' || char === "'") { quote = char; continue; }
+    if (/\s/.test(char)) { if (token === '--') throw new SetupError('HUB launch arguments contain "--"; resolve it before setup.'); token = ''; }
+    else token += char;
+  }
+  if (token === '--') throw new SetupError('HUB launch arguments contain "--"; resolve it before setup.');
+  if (quote || escaped) throw new SetupError('Malformed HUB launch arguments; they were preserved.');
+  const suffix = routingArgs(baseUrl, codexHome);
+  if (current.trimEnd().endsWith(suffix)) return current;
+  return [current, suffix].filter(Boolean).join(' ');
 }
 
 function codingModels(document) {
@@ -63,7 +271,7 @@ function normalizedHome(value, home) {
   return path.resolve(value === '~' ? home : value.startsWith('~/') ? path.join(home, value.slice(2)) : value);
 }
 
-function providerPlan(settings, {home, codexHome, codexBinary, claudeHome, claudeBinary, models, catalog = []}) {
+function providerPlan(settings, {home, codexHome, codexBinary, claudeHome, claudeBinary, models, baseUrl = ORIGIN + '/v1', catalog = []}) {
   const instances = settings.providerInstances;
   if (!instances || typeof instances !== 'object' || Array.isArray(instances)) throw new SetupError('T3 did not return provider settings.');
   const targets = [{id: 'hub_codex', driver: 'codex', name: 'HUB Codex', directory: codexHome, binary: codexBinary}];
@@ -84,9 +292,15 @@ function providerPlan(settings, {home, codexHome, codexBinary, claudeHome, claud
       const known = new Set(current.map(model => typeof model === 'string' ? model : model.slug));
       for (const model of catalog.find(provider => provider.instanceId === id)?.models || []) known.add(model.slug);
       const additions = models[target.driver].filter(model => !known.has(model));
-      const next = {...instance, config: {...instance.config, customModels: [...current, ...additions]}};
+      if (target.driver === 'codex' && (instance.config?.shadowHomePath?.trim() ||
+          instance.environment?.some(variable => variable.name === 'T3CODE_CODEX_LAUNCH_ARGS' && (variable.value?.trim() || variable.valueRedacted)) || process.env.T3CODE_CODEX_LAUNCH_ARGS?.trim())) {
+        throw new SetupError('HUB Codex uses shadowHomePath or T3CODE_CODEX_LAUNCH_ARGS, which overrides its home/routing settings. Resolve that conflict before rerunning.');
+      }
+      const launchArgs = target.driver === 'codex' ? withRoutingArgs(instance.config?.launchArgs, baseUrl, codexHome) : undefined;
+      const next = {...instance, config: {...instance.config, customModels: [...current, ...additions],
+        ...(launchArgs === undefined ? {} : {launchArgs})}};
       plan.push({id, driver: target.driver, instance: next, added: additions.length,
-        changed: !instances[id] || additions.length > 0});
+        changed: !instances[id] || additions.length > 0 || launchArgs !== undefined && launchArgs !== instance.config?.launchArgs});
     }
   }
   return plan;
@@ -118,6 +332,7 @@ async function syncProviders(client, options) {
       operation: current.providerInstances[fresh.id] ? 'upsert' : 'create', instanceId: fresh.id, instance: fresh.instance,
     }});
   }
+  options.beforeRefresh?.();
   const result = await client.request('server.refreshProviders', {fresh: true, refreshModels: true});
   for (const item of plan) {
     const provider = result.providers?.find(provider => provider.instanceId === item.id);
@@ -183,10 +398,13 @@ function localT3(args) {
   return {origin, t3};
 }
 
-async function main(args) {
+async function main(args, dependencies = {}) {
+  const locateT3 = dependencies.localT3 || localT3;
+  const openT3 = dependencies.connect || connect;
+  const execute = dependencies.execFileSync || execFileSync;
   if (typeof WebSocket !== 'function') throw new SetupError('Node.js 22 or later is required.');
   if (args.includes('--check')) {
-    const {origin} = localT3(args);
+    const {origin} = locateT3(args);
     const response = await fetch(origin.origin + '/api/auth/session', {
       signal: AbortSignal.timeout(5000), redirect: 'error',
     });
@@ -196,23 +414,18 @@ async function main(args) {
     return;
   }
   const home = os.homedir();
+  if (args.includes('--check-environment')) { environmentPlan(home); return; }
   const codexHome = option(args, '--codex-home') || ['.dittodub-provider-hub/codex', '.codex-team-hub', '.codex-hub']
-    .map(relative => path.join(home, relative)).find(directory => fs.existsSync(path.join(directory, 'config.toml')));
+    .map(relative => path.join(home, relative)).find(directory => lstat(path.join(directory, 'hub-connection.json')) || lstat(path.join(directory, 'config.toml')));
   if (!codexHome) throw new SetupError('Set up your hub connection first.');
-  const dirStat = fs.lstatSync(codexHome);
-  if (!dirStat.isDirectory() || dirStat.uid !== process.getuid()) throw new SetupError('Unsafe Codex home directory.');
-  const configFile = path.join(codexHome, 'config.toml');
-  const original = readPrivate(configFile), config = parseConfig(original);
+  const standardRoot = path.join(home, '.dittodub-provider-hub');
+  const standardSetup = codexHome === path.join(standardRoot, 'codex');
+  const environment = standardSetup ? environmentPlan(home) : undefined;
+  const connection = environment ? environment.connection : readConnection(codexHome, {home});
+  if (!connection) throw new SetupError('Set up your hub connection first.');
   const keyFile = option(args, '--key-file');
-  const key = keyFile ? readPrivate(keyFile).trim() : config.key;
+  const key = keyFile ? readPrivate(keyFile).trim() : connection.key;
   if (!/^[A-Za-z0-9_-]{40,128}$/.test(key)) throw new SetupError('Invalid hub credential.');
-  const authFile = path.join(codexHome, 'auth.json');
-  let existingAuth;
-  try {
-    existingAuth = readPrivate(authFile);
-    const auth = JSON.parse(existingAuth);
-    if (auth.OPENAI_API_KEY !== config.key || auth.tokens) throw new SetupError('Existing Codex authentication differs; it was preserved.');
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const response = await fetch(ORIGIN + '/v1/usage', {
     headers: {authorization: `Bearer ${key}`}, signal: AbortSignal.timeout(30000), redirect: 'error',
   });
@@ -220,40 +433,31 @@ async function main(args) {
   const data = await response.json();
   if (!Array.isArray(data.accounts)) throw new SetupError('Invalid hub usage response.');
   const modelResponse = await fetch(ORIGIN + '/v1/models', {
-    headers: {authorization: `Bearer ${config.key}`}, signal: AbortSignal.timeout(30000), redirect: 'error',
+    headers: {authorization: `Bearer ${connection.key}`}, signal: AbortSignal.timeout(30000), redirect: 'error',
   });
   if (!modelResponse.ok) throw new SetupError('Could not fetch the hub model catalog. No local configuration was changed. Rerun setup once the hub is reachable.');
   const models = codingModels(await modelResponse.json());
-  const standardRoot = path.join(home, '.dittodub-provider-hub');
   const claudeHome = path.join(standardRoot, 'claude'), claudeBinary = path.join(standardRoot, 'hub-claude');
-  const standardSetup = codexHome === path.join(standardRoot, 'codex');
-  if (standardSetup && (!fs.existsSync(claudeHome) || !fs.existsSync(claudeBinary))) {
-    throw new SetupError('The HUB Claude home or launcher is missing. Finish the main setup-provider-hub.sh installation before syncing models.');
-  }
 
-  const {origin, t3} = localT3(args);
-  const run = command => execFileSync(t3, command, {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000});
+  const {origin, t3} = locateT3(args);
+  const run = command => execute(t3, command, {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000});
   const session = JSON.parse(run(['auth', 'session', 'issue', '--scope', 'orchestration:read', '--scope', 'settings:write', '--scope', 'providers:manage',
     '--ttl', '5m', '--label', 'Hub provider and usage setup', '--json']));
   let client;
   try {
-    client = await connect(origin.origin, session.token);
+    client = await openT3(origin.origin, session.token);
     await client.request('server.updateSettings', {patch: {usageLimitSources: {
       'dittodub-provider-hub': {kind: 'cliproxy', label: 'Multi-Account Hub',
         url: ORIGIN + '/usage', managementKey: key, enabled: true},
     }}});
-    // Classify this connection as API-key auth. Keep the same provider, URL,
-    // bearer credential, and account routing; T3 reads quotas from the source.
-    if (readPrivate(configFile) !== original) throw new SetupError('Codex config changed during setup; retry.');
-    if (existingAuth === undefined) fs.writeFileSync(authFile, JSON.stringify({OPENAI_API_KEY: config.key}) + '\n', {mode: 0o600, flag: 'wx'});
-    if (config.text !== original) {
-      fs.writeFileSync(configFile + '.before-usage-' + Date.now(), original, {mode: 0o600, flag: 'wx'});
-      const temporary = configFile + '.usage-' + process.pid;
-      try { fs.writeFileSync(temporary, config.text, {mode: 0o600, flag: 'wx'}); fs.renameSync(temporary, configFile); }
-      finally { try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
-    }
-    await syncProviders(client, {home, codexHome, models,
-      ...(standardSetup ? {claudeHome, claudeBinary} : {})});
+    // Credentials remain private. Apply links only after every provider has
+    // received explicit routing, and before T3 refresh starts fresh probes.
+    if (JSON.stringify(readConnection(codexHome, {home})) !== JSON.stringify(connection)) throw new SetupError('HUB connection changed during setup; retry.');
+    saveConnection(codexHome, connection);
+    if (standardSetup) saveClaudeCompanion(standardRoot, connection);
+    await syncProviders(client, {home, codexHome, models, baseUrl: connection.baseUrl,
+      ...(standardSetup ? {claudeHome, claudeBinary, beforeRefresh: () => environment.apply()} : {})});
+    if (standardSetup) console.log('HUB Codex shares PERSONAL config, skills, plugins, and AGENTS.md. Auth and runtime state remain separate. Start a fresh provider process to load changes; a catalog refresh does not replace running conversations.');
     console.log(`Hub usage configured for ${data.accounts.length} accessible accounts. Fetches on request, cached for 30 seconds.`);
     if (!standardSetup) console.log('Legacy Codex connection updated. Use the main setup-provider-hub.sh installer for a separate HUB Claude connection.');
   } finally {
@@ -262,7 +466,7 @@ async function main(args) {
   }
 }
 
-module.exports = {parseConfig, codingModels, providerPlan, syncProviders, connect, main};
+module.exports = {providerName, environmentPlan, readConnection, saveConnection, routingArgs, withRoutingArgs, parseConfig, codingModels, providerPlan, syncProviders, connect, main};
 if (require.main === module) main(process.argv.slice(2)).catch(error => {
   console.error(error instanceof SetupError ? error.message
     : 'Provider/model/usage setup failed. Check the local T3 installation, private hub configuration, and network connection. Saved credentials can be reused on the next run.');

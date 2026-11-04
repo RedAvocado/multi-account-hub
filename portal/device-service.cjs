@@ -52,7 +52,7 @@ function createDevices({directory, now=Date.now}) {
       try {record=JSON.parse(fs.readFileSync(path.join(devicesDir,file),'utf8'));} catch (_) {continue;}
       if (!record || !/^[a-z][a-z0-9_-]{0,40}$/.test(record.name||'') || typeof record.email!=='string' || record.email.length>254) continue;
       result.push({id:match[1],kind:'device',user:record.name,email:record.email,enabled:record.enabled===true,
-        name:cleanLabel(record.deviceName)||'Unnamed computer',platform:cleanLabel(record.platform,40),
+        name:cleanLabel(record.deviceName)||'Unnamed computer',platform:cleanLabel(record.platform,40),usageOnly:record.scope==='usage',
         createdAt:record.createdAt||null,...seen(match[1])});
     }
     let users=[];

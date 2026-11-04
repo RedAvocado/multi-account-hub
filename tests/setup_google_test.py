@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -43,27 +44,33 @@ exec(compile(source,"<setup>","exec"), {{"__name__":"__main__"}})
     fake.chmod(0o700)
     events = root / 'events'
     fake_curl = binaries / 'curl'
-    fake_curl.write_text("#!/bin/sh\nfor arg; do destination=\"$arg\"; done\nprintf '// usage helper fixture\\n' > \"$destination\"\n")
+    helper = root / 'usage.cjs'
+    helper.write_text((source.parent.parent / 'scripts/configure-t3-usage.cjs').read_text().replace('__HUB_ORIGIN__', 'https://hub.example.com'))
+    fake_curl.write_text('#!/bin/sh\nfor arg; do destination="$arg"; done\ncp "$USAGE_FIXTURE" "$destination"\n')
     fake_curl.chmod(0o700)
     fake_node = binaries / 'node'
     fake_node.write_text(f'''#!{sys.executable}
-import os,sys,pathlib
+import os,sys,pathlib,subprocess
 with open(os.environ["SETUP_EVENTS"],"a") as log: log.write(sys.argv[2]+"\\n")
 if sys.argv[2] == "--check":
     sys.exit(1 if os.environ.get("FAIL_CHECK") else 0)
+if sys.argv[2] == "--check-environment":
+    sys.exit(subprocess.run([{shutil.which('node')!r}, sys.argv[1], '--check-environment']).returncode)
 assert sys.argv[2] == "--codex-home"
-assert pathlib.Path(sys.argv[3],"config.toml").is_file()
-sys.exit(1 if os.environ.get("FAIL_USAGE") else 0)
+assert pathlib.Path(sys.argv[3],"hub-connection.json").is_file()
+if os.environ.get("FAIL_USAGE"): sys.exit(1)
+sys.exit(subprocess.run([{shutil.which('node')!r}, '-e', "require(process.argv[1]).environmentPlan(require('os').homedir()).apply()", sys.argv[1]]).returncode)
 ''')
     fake_node.chmod(0o700)
-    env = {**os.environ, 'HOME': str(home), 'PATH': str(binaries) + ':' + os.environ['PATH'], 'SETUP_EVENTS': str(events)}
+    env = {**os.environ, 'HOME': str(home), 'PATH': str(binaries) + ':' + os.environ['PATH'], 'SETUP_EVENTS': str(events), 'USAGE_FIXTURE': str(helper)}
     def run(code):
         return subprocess.run(['/bin/bash', str(script)], input=code + '\n', text=True, capture_output=True, env=env, timeout=10)
     first = run('c' * 43)
     assert first.returncode == 0, first.stderr
     config = home / '.dittodub-provider-hub/codex/config.toml'
     assert config.exists() and config.stat().st_mode & 0o777 == 0o600
-    assert 'experimental_bearer_token = "' + 'k' * 64 + '"' in config.read_text()
+    assert config.is_symlink() and config.read_text() == ''
+    assert 'k' * 64 in (config.parent / 'auth.json').read_text()
     device_key = home / '.dittodub-provider-hub/device-key'
     wrapper = home / '.dittodub-provider-hub/hub-claude'
     assert device_key.stat().st_mode & 0o777 == 0o600
@@ -87,7 +94,7 @@ printf 'launcher verified\\n'
     previous = config.read_bytes()
     second = run('c' * 43)
     assert second.returncode == 0 and config.read_bytes() == previous
-    assert events.read_text().splitlines() == ['--check', 'redeem', '--codex-home', '--check', '--codex-home']
+    assert events.read_text().splitlines() == ['--check', '--check-environment', 'redeem', '--codex-home', '--check', '--check-environment', '--codex-home']
     # A missing prerequisite must not consume a setup code or create credentials.
     blocked_home = root / 'blocked-home'; blocked_home.mkdir()
     blocked = subprocess.run(['/bin/bash', str(script)], input='c' * 43 + '\n', text=True, capture_output=True,
@@ -99,7 +106,7 @@ printf 'launcher verified\\n'
     failed = subprocess.run(['/bin/bash', str(script)], input='c' * 43 + '\n', text=True, capture_output=True,
         env={**env, 'HOME': str(retry_home), 'FAIL_USAGE': '1'}, timeout=10)
     assert failed.returncode != 0 and 'rerun this setup' in failed.stderr
-    saved = retry_home / '.dittodub-provider-hub/codex/config.toml'
+    saved = retry_home / '.dittodub-provider-hub/codex/hub-connection.json'
     saved_bytes = saved.read_bytes()
     retried = subprocess.run(['/bin/bash', str(script)], input='', text=True, capture_output=True,
         env={**env, 'HOME': str(retry_home)}, timeout=10)
@@ -111,7 +118,7 @@ printf 'launcher verified\\n'
         env={**env, 'HOME': str(key_home)}, timeout=10)
     assert keyed.returncode == 0, keyed.stderr
     assert (key_home / '.dittodub-provider-hub/device-key').read_text().strip() == 'd' * 43
-    assert 'base_url = "https://hub.example.com/v1"' in (key_home / '.dittodub-provider-hub/codex/config.toml').read_text()
+    assert 'https://hub.example.com/v1' in (key_home / '.dittodub-provider-hub/codex/hub-connection.json').read_text()
     assert 'd' * 43 not in keyed.stdout + keyed.stderr
     assert events.read_text().splitlines().count('redeem') == 2 and events.read_text().splitlines().count('verify') == 1
     rejected = subprocess.run(['/bin/bash', str(script), '--key'], input='not a key\n', text=True, capture_output=True,
