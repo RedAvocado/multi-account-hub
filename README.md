@@ -88,10 +88,14 @@ What the hub adds:
 ### Choosing an account
 
 New sessions use a weighted choice among the member's permitted, available
-accounts. More remaining quota gets more weight; an approaching quota reset
-adds a small bonus. Every applicable window counts, so an empty weekly quota
-cannot be offset by a full five-hour quota. Claude model-specific limits apply
-only to that model family; Cowork limits do not constrain coding requests.
+accounts. More remaining quota gets more weight, which spreads load. Quota that
+would otherwise expire unused gets up to four times the weight: an account
+with half its week left and a reset tomorrow leads over a freshly reset one,
+which still gets a real share. Five-hour windows don't add this pull, because
+their capacity comes back within hours. Every applicable window counts, so an
+empty weekly quota cannot be offset by a full five-hour quota. Claude
+model-specific limits apply only to that model family; Cowork limits do not
+constrain coding requests.
 
 New sessions avoid accounts within a 3% reserve when healthier accounts are
 available. Healthy sessions stay on the same account for prompt caching, with a

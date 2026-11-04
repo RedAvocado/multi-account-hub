@@ -11,7 +11,7 @@ index 2e159d4..22b997e 100644
  require (
  	github.com/router-for-me/CLIProxyAPI/v8 v8.0.0
 diff --git a/main.go b/main.go
-index 3a3a1b3..329377d 100644
+index 3a3a1b3..c8e4459 100644
 --- a/main.go
 +++ b/main.go
 @@ -50,7 +50,9 @@ import (
@@ -29,7 +29,7 @@ index 3a3a1b3..329377d 100644
  )
  
 -const pluginVersion = "0.5.0"
-+const pluginVersion = "0.7.0"
++const pluginVersion = "0.8.0"
  
  // configUIPath is the resource path shown as a menu page in the management panel,
  // served at /v0/resource/plugins/key-router/config.
@@ -345,10 +345,10 @@ index 3a3a1b3..329377d 100644
  func loadedConfig() *routingTable {
 diff --git a/quota.go b/quota.go
 new file mode 100644
-index 0000000..036e075
+index 0000000..4080d3b
 --- /dev/null
 +++ b/quota.go
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,323 @@
 +package main
 +
 +import (
@@ -482,34 +482,58 @@ index 0000000..036e075
 +	return value
 +}
 +
++// maxExpiryBoost caps how strongly quota that would otherwise expire unused
++// pulls new sessions. It tilts the balance; it never routes everything to one
++// account.
++const maxExpiryBoost = 4.0
++
 +// Scores are admission hints, not a token-capacity estimate. The tightest
-+// relevant quota controls the weight; reset urgency contributes at most 25%.
++// relevant quota controls the base weight, so load stays balanced by headroom.
++// Expiry pressure then multiplies it: an account whose long-window quota is
++// ahead of schedule (much left, little time until reset) gets up to
++// maxExpiryBoost times the weight, so quota that resets soon is spent first.
 +func quotaScore(candidate pluginapi.SchedulerAuthCandidate, model string, snapshot quotaSnapshot, now time.Time) (float64, bool, float64) {
 +	headroom, known := quotaHeadroom(candidate, model, snapshot, now)
 +	if !known {
 +		return 0, false, headroom
 +	}
-+	weight := math.Inf(1)
++	weight, pace := math.Inf(1), math.Inf(1)
 +	quota := snapshot.Accounts[candidate.ID]
 +	for _, window := range quota.Windows {
 +		if !validQuotaWindow(window, candidate.Provider, model, quota.CheckedAt, now) {
 +			continue
 +		}
 +		r := math.Max(0, (*window.Remaining/100-0.03)/0.97)
-+		urgency := 0.0
-+		if window.ResetsAt != nil {
-+			horizon := 30 * time.Minute
-+			if window.DurationSeconds >= 604800 || window.Label == "1w" || window.Label == "Opus" || window.Label == "Sonnet" || window.Label == "Fable" {
-+				horizon = 6 * time.Hour
-+			}
-+			if window.DurationSeconds >= 2419200 || window.Label == "1mo" {
-+				horizon = 24 * time.Hour
-+			}
-+			urgency = math.Max(0, math.Min(1, 1-window.ResetsAt.Sub(now).Seconds()/horizon.Seconds()))
++		weight = math.Min(weight, math.Pow(r, 1.5))
++		// Only day-or-longer windows create expiry pressure: unused five-hour
++		// capacity comes back within hours, unused weekly quota is lost. The
++		// tightest long window bounds how much extra work the account can take.
++		if duration := windowDuration(window); duration >= 24*time.Hour && window.ResetsAt != nil {
++			left := math.Max(time.Minute.Seconds(), math.Min(duration.Seconds(), window.ResetsAt.Sub(now).Seconds())) / duration.Seconds()
++			pace = math.Min(pace, r/left)
 +		}
-+		weight = math.Min(weight, math.Pow(r, 1.5)*(1+0.25*urgency))
 +	}
-+	return math.Max(0.0025, weight) * bankedResetMultiplier(candidate.Provider, quota.ResetCredits, now), true, headroom
++	boost := 1.0
++	if !math.IsInf(pace, 1) {
++		boost = math.Max(1, math.Min(maxExpiryBoost, pace))
++	}
++	return math.Max(0.0025, weight*boost) * bankedResetMultiplier(candidate.Provider, quota.ResetCredits, now), true, headroom
++}
++
++// windowDuration prefers the reported length and falls back to the label.
++func windowDuration(window quotaWindow) time.Duration {
++	if window.DurationSeconds > 0 {
++		return time.Duration(window.DurationSeconds) * time.Second
++	}
++	switch window.Label {
++	case "5h":
++		return 5 * time.Hour
++	case "1w", "Opus", "Sonnet", "Fable":
++		return 7 * 24 * time.Hour
++	case "1mo":
++		return 30 * 24 * time.Hour
++	}
++	return 0
 +}
 +
 +// Banked resets favor new sessions on accounts whose credits will expire soon.
@@ -650,10 +674,10 @@ index 0000000..036e075
 +}
 diff --git a/quota_test.go b/quota_test.go
 new file mode 100644
-index 0000000..205f7df
+index 0000000..e425653
 --- /dev/null
 +++ b/quota_test.go
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,579 @@
 +package main
 +
 +import (
@@ -1001,8 +1025,73 @@ index 0000000..205f7df
 +	quota.Windows[0].ResetsAt = &soon
 +	snapshot.Accounts["work"] = quota
 +	boosted, _, _ := quotaScore(candidates[0], "gpt-6-sol", snapshot, now)
-+	if boosted <= base || boosted > base*1.25 {
++	if boosted <= base || boosted > base*maxExpiryBoost {
 +		t.Fatal("reset urgency must supply a bounded positive boost")
++	}
++}
++
++func expiryFixture(now time.Time, accounts map[string][2]float64) ([]pluginapi.SchedulerAuthCandidate, quotaSnapshot) {
++	snapshot := quotaSnapshot{Version: 1, Accounts: map[string]accountQuota{}}
++	candidates := []pluginapi.SchedulerAuthCandidate{}
++	for id, value := range accounts {
++		remaining, resets := value[0], now.Add(time.Duration(value[1]*float64(time.Hour)))
++		candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: id, Provider: "codex"})
++		snapshot.Accounts[id] = accountQuota{Provider: "codex", CheckedAt: now, Windows: []quotaWindow{
++			{Label: "1w", Scope: "general", DurationSeconds: 604800, Remaining: &remaining, ResetsAt: &resets},
++		}}
++	}
++	return candidates, snapshot
++}
++
++func shareOf(candidates []pluginapi.SchedulerAuthCandidate, snapshot quotaSnapshot, now time.Time, id string) float64 {
++	hits := 0
++	const n = 20000
++	for i := 0; i < n; i++ {
++		if weightedAccount(candidates, "gpt-6-sol", fmt.Sprintf("expiry-%d", i), snapshot, now) == id {
++			hits++
++		}
++	}
++	return float64(hits) / n
++}
++
++// Half a week left that resets tomorrow must lead over a fresh week, but the
++// fresh account keeps a real share: the tilt balances, it does not starve.
++func TestQuotaResettingSoonLeadsWithoutStarvingFreshAccounts(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := expiryFixture(now, map[string][2]float64{"soon": {51, 22}, "fresh": {90, 158}})
++	share := shareOf(candidates, snapshot, now, "soon")
++	if share < 0.52 || share > 0.75 {
++		t.Fatalf("quota resetting soon should lead moderately, got %.2f%%", share*100)
++	}
++}
++
++func TestOnScheduleAccountsBalanceByHeadroomAlone(t *testing.T) {
++	now := time.Now()
++	// Both spend at or under the pace their reset allows: no expiry boost.
++	candidates, snapshot := expiryFixture(now, map[string][2]float64{"a": {80, 150}, "b": {40, 80}})
++	for _, candidate := range candidates {
++		got, _, _ := quotaScore(candidate, "gpt-6-sol", snapshot, now)
++		r := (*snapshot.Accounts[candidate.ID].Windows[0].Remaining/100 - 0.03) / 0.97
++		if math.Abs(got-math.Pow(r, 1.5)) > 1e-9 {
++			t.Fatalf("%s: on-schedule quota received an expiry boost", candidate.ID)
++		}
++	}
++}
++
++func TestExpiryPressureCannotReviveDrainingAccountOrComeFromShortWindows(t *testing.T) {
++	now := time.Now()
++	candidates, snapshot := expiryFixture(now, map[string][2]float64{"nearly-empty": {6, 1}, "healthy": {80, 150}})
++	if share := shareOf(candidates, snapshot, now, "nearly-empty"); share > 0.05 {
++		t.Fatalf("expiry pressure overrode low headroom: %.2f%%", share*100)
++	}
++	remaining, soon := 95.0, now.Add(10*time.Minute)
++	short := quotaSnapshot{Version: 1, Accounts: map[string]accountQuota{"a": {Provider: "codex", CheckedAt: now, Windows: []quotaWindow{
++		{Label: "5h", DurationSeconds: 18000, Remaining: &remaining, ResetsAt: &soon},
++	}}}}
++	candidate := pluginapi.SchedulerAuthCandidate{ID: "a", Provider: "codex"}
++	got, _, _ := quotaScore(candidate, "gpt-6-sol", short, now)
++	if want := math.Pow((0.95-0.03)/0.97, 1.5); math.Abs(got-want) > 1e-9 {
++		t.Fatal("a five-hour window must not create expiry pressure")
 +	}
 +}
 +
