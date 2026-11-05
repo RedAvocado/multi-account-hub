@@ -89,7 +89,7 @@ What the hub adds:
 
 New sessions use a weighted choice among the member's permitted, available
 accounts. More remaining quota gets more weight, which spreads load. Quota that
-would otherwise expire unused gets up to four times the weight: an account
+would otherwise expire unused gets up to eight times the weight: an account
 with half its week left and a reset tomorrow leads over a freshly reset one,
 which still gets a real share. Five-hour windows don't add this pull, because
 their capacity comes back within hours. Every applicable window counts, so an

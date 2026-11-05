@@ -345,10 +345,10 @@ index 3a3a1b3..c8e4459 100644
  func loadedConfig() *routingTable {
 diff --git a/quota.go b/quota.go
 new file mode 100644
-index 0000000..4080d3b
+index 0000000..7c73b7a
 --- /dev/null
 +++ b/quota.go
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,325 @@
 +package main
 +
 +import (
@@ -483,9 +483,11 @@ index 0000000..4080d3b
 +}
 +
 +// maxExpiryBoost caps how strongly quota that would otherwise expire unused
-+// pulls new sessions. It tilts the balance; it never routes everything to one
-+// account.
-+const maxExpiryBoost = 4.0
++// pulls new sessions. The cap is deliberately higher than the old 4x limit:
++// once a long window is in its final hours, its quota needs a strong pull to
++// be spent before the reset. The admission reserve still prevents a draining
++// account from receiving new sessions when a healthier account exists.
++const maxExpiryBoost = 8.0
 +
 +// Scores are admission hints, not a token-capacity estimate. The tightest
 +// relevant quota controls the base weight, so load stays balanced by headroom.
@@ -674,10 +676,10 @@ index 0000000..4080d3b
 +}
 diff --git a/quota_test.go b/quota_test.go
 new file mode 100644
-index 0000000..e425653
+index 0000000..3d05fd2
 --- /dev/null
 +++ b/quota_test.go
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,594 @@
 +package main
 +
 +import (
@@ -1062,6 +1064,21 @@ index 0000000..e425653
 +	share := shareOf(candidates, snapshot, now, "soon")
 +	if share < 0.52 || share > 0.75 {
 +		t.Fatalf("quota resetting soon should lead moderately, got %.2f%%", share*100)
++	}
++}
++
++func TestNearResetQuotaGetsStrongUrgencyPull(t *testing.T) {
++	now := time.Now()
++	// The soon account has less headroom, but its weekly quota resets in under
++	// an hour. The scheduler should spend most new sessions there before that
++	// quota disappears, while preserving a meaningful share for the later reset.
++	candidates, snapshot := expiryFixture(now, map[string][2]float64{
++		"soon":  {34, 0.75},
++		"later": {66, 6.7 * 24},
++	})
++	share := shareOf(candidates, snapshot, now, "soon")
++	if share < 0.70 || share > 0.80 {
++		t.Fatalf("quota resetting within an hour should receive about three quarters of new sessions, got %.2f%%", share*100)
 +	}
 +}
 +
